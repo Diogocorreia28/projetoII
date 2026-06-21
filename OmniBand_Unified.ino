@@ -1,53 +1,35 @@
 // =====================================================================
 // OmniBand_Unified.ino
 // =====================================================================
-// Merged firmware: all three sketches in ONE file.
+// Fully integrated firmware combining:
+//   1. Simple threshold-based gesture detection (codigo_funciona_cima.txt)
+//   2. Full state machine: wake + clap context + 4 gestures (Menu_bonito_palmas.ino)
+//   3. ML classifier inference via Edge Impulse (teste_ml_gesto_unico.ino)
 //
-// Switch between modes by changing ACTIVE_MODE below:
-//   MODE_SIMPLE  = Simple up/down threshold detection (codigo_funciona_cima.txt)
-//   MODE_FULL    = Full state machine with clap context + 4 gestures (Menu_bonito_palmas.ino)
-//   MODE_ML_TEST = Single-shot Edge Impulse ML classifier test (teste_ml_gesto_unico.ino)
+// How it works:
+//   - Normal operation: full state machine (IDLE → CONTEXT → GESTURE → RESULT)
+//   - In IDLE state, simple threshold gestures (Cima/Baixo) also trigger quick actions
+//   - Press BtnA briefly: recalibrate sensors
+//   - Press and hold BtnA (>2s): run ML diagnostic test (capture → classify → display)
 // =====================================================================
 
-// =====================================================================
-// MODE SELECTOR — change this line to switch modes
-// =====================================================================
-#define MODE_SIMPLE  1
-#define MODE_FULL    2
-#define MODE_ML_TEST 3
-
-#ifndef ACTIVE_MODE
-#define ACTIVE_MODE MODE_FULL   // <--- CHANGE HERE: MODE_SIMPLE, MODE_FULL, or MODE_ML_TEST
-#endif
-
-// =====================================================================
-// SHARED INCLUDES
-// =====================================================================
 #include <M5Unified.h>
 #include <Wire.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <math.h>
 #include "BMI088.h"
-
-#if ACTIVE_MODE == MODE_ML_TEST
 #include <correia_2k-project-1_inferencing.h>
-#endif
 
 // =====================================================================
-// SHARED CONSTANTS — WiFi & Server
+// WiFi & Server Configuration
 // =====================================================================
-// NOTE: Change these to match your network and server
 const char* WIFI_SSID = "CasaLt33";
 const char* WIFI_PASS = "luisdiogo";
 const char* SERVER_URL = "http://192.168.1.233:5000/api/trigger";
 
-// Simple-mode credentials (used if different, but we reuse the same variables above)
-// const char* WIFI_SSID_SIMPLE = "Vodafone-46F617 _EXT_2.4G";
-// const char* WIFI_PASS_SIMPLE = "portugalia1";
-
 // =====================================================================
-// SHARED CONSTANTS — I2C pins
+// I2C Pins
 // =====================================================================
 const uint8_t I2C_PRIMARY_SDA   = 33;
 const uint8_t I2C_PRIMARY_SCL   = 32;
@@ -55,7 +37,7 @@ const uint8_t I2C_FALLBACK_SDA  = 32;
 const uint8_t I2C_FALLBACK_SCL  = 33;
 
 // =====================================================================
-// SHARED — BMI088 IMU objects (with fallback candidates)
+// BMI088 IMU Objects (with fallback candidates)
 // =====================================================================
 Bmi088Accel accelDefault(Wire, 0x19);
 Bmi088Gyro  gyroDefault (Wire, 0x69);
@@ -68,205 +50,24 @@ Bmi088Gyro*  gyro  = &gyroDefault;
 float ax0 = 0, ay0 = 0, az0 = 0;
 
 // =====================================================================
-// SHARED FUNCTIONS — IMU init
+// Microphone pin
 // =====================================================================
-bool beginImuCandidate(uint8_t sda, uint8_t scl,
-                       Bmi088Accel& accelCandidate, Bmi088Gyro& gyroCandidate,
-                       const char* name) {
-  Wire.end(); delay(40);
-  Wire.begin(sda, scl); Wire.setClock(400000);
-  if (accelCandidate.begin() < 0) return false;
-  if (gyroCandidate.begin() < 0) return false;
-  accel = &accelCandidate; gyro = &gyroCandidate;
-  Serial.printf("[imu] BMI088 OK (%s) SDA=G%d SCL=G%d\n", name, sda, scl);
-  return true;
-}
-
-bool initImu() {
-  if (beginImuCandidate(I2C_PRIMARY_SDA,  I2C_PRIMARY_SCL,  accelDefault, gyroDefault, "0x19/0x69")) return true;
-  if (beginImuCandidate(I2C_PRIMARY_SDA,  I2C_PRIMARY_SCL,  accelAlt,     gyroAlt,     "0x18/0x68")) return true;
-  if (beginImuCandidate(I2C_FALLBACK_SDA, I2C_FALLBACK_SCL, accelDefault, gyroDefault, "0x19/0x69 fallback")) return true;
-  if (beginImuCandidate(I2C_FALLBACK_SDA, I2C_FALLBACK_SCL, accelAlt,     gyroAlt,     "0x18/0x68 fallback")) return true;
-  return false;
-}
-
-// =====================================================================
-// SHARED — Calibration
-// =====================================================================
-void calibrateZero() {
-  const int n = 50;
-  float sx = 0, sy = 0, sz = 0;
-
-  for (int i = 0; i < n; i++) {
-    accel->readSensor();
-    sx += accel->getAccelX_mss();
-    sy += accel->getAccelY_mss();
-    sz += accel->getAccelZ_mss();
-    delay(20);
-  }
-
-  ax0 = sx / n;
-  ay0 = sy / n;
-  az0 = sz / n;
-}
-
-// =====================================================================
-// SHARED — WiFi connection
-// =====================================================================
-bool connectWiFi(unsigned long timeoutMs = 12000) {
-  if (WiFi.status() == WL_CONNECTED) return true;
-  if (String(WIFI_SSID).length() == 0) return false;
-  WiFi.mode(WIFI_STA); WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.print("[wifi] A ligar");
-  unsigned long startedAt = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - startedAt < timeoutMs) {
-    Serial.print(".");
-    delay(500);
-  }
-  Serial.println();
-  return WiFi.status() == WL_CONNECTED;
-}
-
-// =====================================================================
-// SHARED — HTTP POST (simple version for MODE_SIMPLE)
-// =====================================================================
-#if ACTIVE_MODE == MODE_SIMPLE
-bool postGesture(const char* gesture) {
-  if (WiFi.status() != WL_CONNECTED) {
-    if (!connectWiFi(5000)) return false;
-  }
-
-  HTTPClient http;
-  http.begin(SERVER_URL);
-  http.addHeader("Content-Type", "application/json");
-
-  String payload = String("{\"gesto\":\"") + gesture + "\"}";
-  int code = http.POST(payload);
-
-  Serial.print("Payload enviado: ");
-  Serial.println(payload);
-  Serial.print("HTTP code: ");
-  Serial.println(code);
-
-  http.end();
-
-  return code > 0 && code < 400;
-}
-#endif
-
-// =====================================================================
-// ========================  MODE: SIMPLE  ============================
-// =====================================================================
-#if ACTIVE_MODE == MODE_SIMPLE
-
-unsigned long lastSend = 0;
-const unsigned long cooldownMs = 1500;
-
-void setup() {
-  auto cfg = M5.config();
-  cfg.clear_display = true;
-  M5.begin(cfg);
-
-  Serial.begin(115200);
-  delay(1000);
-
-  Wire.begin(I2C_PRIMARY_SDA, I2C_PRIMARY_SCL);
-
-  connectWiFi();
-  Serial.print("WiFi ligado. IP: ");
-  Serial.println(WiFi.localIP());
-
-  Serial.println("A iniciar BMI088...");
-  if (accel->begin() < 0) {
-    Serial.println("Erro a iniciar acelerometro");
-    while (1) delay(1000);
-  }
-  if (gyro->begin() < 0) {
-    Serial.println("Erro a iniciar giroscopio");
-    while (1) delay(1000);
-  }
-
-  Serial.println("Calibrando...");
-  calibrateZero();
-  Serial.println("Calibrado");
-}
-
-void loop() {
-  accel->readSensor();
-  gyro->readSensor();
-
-  float ax = accel->getAccelX_mss() - ax0;
-  float ay = accel->getAccelY_mss() - ay0;
-  float az = accel->getAccelZ_mss() - az0;
-
-  Serial.print("AX: "); Serial.print(ax, 3);
-  Serial.print(" AY: "); Serial.print(ay, 3);
-  Serial.print(" AZ: "); Serial.println(az, 3);
-
-  float mag = sqrt(ax * ax + ay * ay + az * az);
-
-  bool gestoCima = false;
-  bool gestoBaixo = false;
-
-  if (millis() - lastSend > cooldownMs) {
-    if (az > 6.0 && mag > 7.0) {
-      gestoCima = true;
-    }
-    else if (az < -6.0 && mag > 7.0) {
-      gestoBaixo = true;
-    }
-  }
-
-  if (gestoCima) {
-    Serial.println("Gesto Cima detetado");
-    if (postGesture("Cima")) {
-      Serial.println("Enviado ao servidor");
-      lastSend = millis();
-    } else {
-      Serial.println("Falha ao enviar");
-    }
-  }
-
-  if (gestoBaixo) {
-    Serial.println("Gesto Baixo detetado");
-    if (postGesture("Baixo")) {
-      Serial.println("Enviado ao servidor");
-      lastSend = millis();
-    } else {
-      Serial.println("Falha ao enviar");
-    }
-  }
-
-  delay(50);
-}
-
-// =====================================================================
-// ========================  MODE: FULL  ==============================
-// =====================================================================
-#elif ACTIVE_MODE == MODE_FULL
-
 const uint8_t MIC_ANALOG_PIN = 36;
 
+// =====================================================================
+// MICROPHONE — Adaptive Clap Detection Constants
+// =====================================================================
 const int AUDIO_PULSE_THRESHOLD = 650;
-const int MIC_NOISE_MARGIN = 220;
-
-// O limite baixo de ruído adequado ao teu microfone
 const int MIC_VALID_AVG_MIN = 30;
 const int MIC_VALID_AVG_MAX = 3900;
+const float CLAP_RATIO_THRESHOLD = 2.8f;
+const int   MIN_CLAP_ABSOLUTE    = 600;
+const int   NOISE_FLOOR_CAP      = 900;
+const float NOISE_RISE_ALPHA     = 0.12f;
+const float NOISE_FALL_ALPHA     = 0.025f;
 
-// === DETEÇÃO ADAPTATIVA (funciona mesmo com pessoas a falar) ===
-// Em vez de um limiar fixo, o sistema mede o ruído ambiente em tempo real
-// e só conta palma quando o som está X vezes acima desse ruído.
-const float CLAP_RATIO_THRESHOLD = 2.8f;  // Palma deve ser 2.8x acima do piso de ruído
-const int   MIN_CLAP_ABSOLUTE    = 600;   // Mínimo absoluto P2P — nunca detetar abaixo disto
-const int   NOISE_FLOOR_CAP      = 900;   // Tecto máximo do piso (não adaptar até ficar surdo)
-const float NOISE_RISE_ALPHA     = 0.12f; // Rapidez com que o piso sobe (reage à conversa)
-const float NOISE_FALL_ALPHA     = 0.025f;// Rapidez com que o piso desce (retorno ao silêncio)
-
-// Tempos de amostragem contínua para apanhar bem a palma
 const unsigned long MIC_SAMPLE_MS = 40;
 const unsigned long MIC_SAMPLE_INTERVAL_MS = 40;
-
 const unsigned long MIC_SETTLE_AFTER_WAKE_MS = 700;
 const unsigned long CLAP_DEBOUNCE_MS = 200;
 const unsigned long CLAP_GAP_MS = 2500;
@@ -274,7 +75,17 @@ const unsigned long CONTEXT_WINDOW_MS = 7000;
 const unsigned long CONTEXT_WAIT_TIMEOUT_MS = 10000;
 const int MAX_CONTEXT_CLAPS = 3;
 
-// Limiares fortes para movimentos
+// =====================================================================
+// GESTURE — IMU Thresholds
+// =====================================================================
+// SIMPLE mode thresholds (always-on quick gestures)
+const float SIMPLE_CIMA_THRESHOLD_AZ = 6.0f;
+const float SIMPLE_CIMA_THRESHOLD_MAG = 7.0f;
+const float SIMPLE_BAIXO_THRESHOLD_AZ = -6.0f;
+const float SIMPLE_BAIXO_THRESHOLD_MAG = 7.0f;
+const unsigned long SIMPLE_COOLDOWN_MS = 1500;
+
+// FULL mode thresholds
 const float WAKE_ACCEL_DELTA_THRESHOLD = 3.0f;
 const float WAKE_GYRO_THRESHOLD_DPS = 150.0f;
 const unsigned long WAKE_COOLDOWN_MS = 1200;
@@ -287,26 +98,35 @@ const float RAD_TO_DEG_PER_SEC = 57.2957795f;
 const unsigned long GESTURE_WINDOW_MS = 9000;
 const unsigned long GESTURE_COOLDOWN_MS = 1500;
 const unsigned long RESULT_RETURN_MS = 3000;
-
 const bool INVERT_ROTATION_GESTURES = false;
 
+// =====================================================================
+// ML test constants
+// =====================================================================
+const unsigned long PRE_CAPTURE_MS = 1000;
+const float ML_CONFIDENCE_OK = 0.65f;
+const unsigned long BTN_HOLD_MS = 2000;  // Hold button for 2s to enter ML test
+
+// =====================================================================
+// State Variables
+// =====================================================================
 bool imuReady = false;
 bool micReady = false;
 int micThreshold = AUDIO_PULSE_THRESHOLD;
+float adaptiveNoiseFloor = 350.0f;
+unsigned long lastPlotterAt = 0;
 
-// === ESTADO ADAPTATIVO DO MICROFONE ===
-float adaptiveNoiseFloor = 350.0f;  // Estimativa corrente do ruído P2P ambiente
-unsigned long lastPlotterAt = 0;    // Throttle do Serial Plotter
-
+// Full state machine
 unsigned long lastWakeAt = 0;
 unsigned long lastGestureAt = 0;
 unsigned long lastImuSerialAt = 0;
-unsigned long lastMicWarningAt = 0;
 unsigned long lastMicSampleAt = 0;
 unsigned long stateStartedAt = 0;
 unsigned long firstClapAt = 0;
 unsigned long lastClapAt = 0;
 unsigned long returnToIdleAt = 0;
+unsigned long btnPressStartedAt = 0;
+bool btnHeld = false;
 
 int clapCount = 0;
 int activeClaps = 0;
@@ -314,11 +134,15 @@ int imuFaultCount = 0;
 int wakeHitCount = 0;
 const char* activeRoom = "sem contexto";
 
+// Simple mode
+unsigned long simpleLastSend = 0;
+
 enum AppState {
   STATE_IDLE,
   STATE_CONTEXT,
   STATE_GESTURE,
-  STATE_RESULT
+  STATE_RESULT,
+  STATE_ML_TEST     // ML diagnostic mode
 };
 
 enum GestureId {
@@ -359,6 +183,10 @@ AppState appState = STATE_IDLE;
 ImuReading previousReading;
 bool hasPreviousReading = false;
 
+// =====================================================================
+// Helper Functions
+// =====================================================================
+
 GestureInfo gestureInfo(GestureId id) {
   switch (id) {
     case GESTURE_UP: return {GESTURE_UP, "Cima", "Cima", "Aumentar/subir"};
@@ -376,39 +204,217 @@ const char* roomFromClaps(int pulses) {
 }
 
 // =====================================================================
-// UI — CoreInk (200x200, e-paper monocromático)
+// IMU Initialization
 // =====================================================================
-// Princípios:
-//  - epd_text para redraws completos de ecrã (boa nitidez de texto, refresh moderado)
-//  - epd_fastest + setClipRect só para o indicador "a ouvir", para não
-//    repintar o ecrã inteiro a cada tick (poupa tempo e desgaste de refresh)
-//  - Sem cor: hierarquia feita com blocos invertidos (preto/branco) e
-//    espessura de traço, nunca com tons de cinzento
-//  - Ícones desenhados com primitivas (linhas/triângulos/arcos), sem
-//    libs extra de glifos
+
+bool beginImuCandidate(uint8_t sda, uint8_t scl,
+                       Bmi088Accel& accelCandidate, Bmi088Gyro& gyroCandidate,
+                       const char* name) {
+  Wire.end(); delay(40);
+  Wire.begin(sda, scl); Wire.setClock(400000);
+  if (accelCandidate.begin() < 0) return false;
+  if (gyroCandidate.begin() < 0) return false;
+  accel = &accelCandidate; gyro = &gyroCandidate;
+  Serial.printf("[imu] BMI088 OK (%s) SDA=G%d SCL=G%d\n", name, sda, scl);
+  return true;
+}
+
+bool initImu() {
+  if (beginImuCandidate(I2C_PRIMARY_SDA,  I2C_PRIMARY_SCL,  accelDefault, gyroDefault, "0x19/0x69")) return true;
+  if (beginImuCandidate(I2C_PRIMARY_SDA,  I2C_PRIMARY_SCL,  accelAlt,     gyroAlt,     "0x18/0x68")) return true;
+  if (beginImuCandidate(I2C_FALLBACK_SDA, I2C_FALLBACK_SCL, accelDefault, gyroDefault, "0x19/0x69 fallback")) return true;
+  if (beginImuCandidate(I2C_FALLBACK_SDA, I2C_FALLBACK_SCL, accelAlt,     gyroAlt,     "0x18/0x68 fallback")) return true;
+  return false;
+}
+
+// =====================================================================
+// Calibration
+// =====================================================================
+
+void calibrateZero() {
+  const int n = 50;
+  float sx = 0, sy = 0, sz = 0;
+  for (int i = 0; i < n; i++) {
+    accel->readSensor();
+    sx += accel->getAccelX_mss();
+    sy += accel->getAccelY_mss();
+    sz += accel->getAccelZ_mss();
+    delay(20);
+  }
+  ax0 = sx / n;
+  ay0 = sy / n;
+  az0 = sz / n;
+}
+
+// =====================================================================
+// WiFi
+// =====================================================================
+
+bool connectWiFi(unsigned long timeoutMs = 12000) {
+  if (WiFi.status() == WL_CONNECTED) return true;
+  if (String(WIFI_SSID).length() == 0) return false;
+  WiFi.mode(WIFI_STA); WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("[wifi] A ligar");
+  unsigned long startedAt = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startedAt < timeoutMs) {
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.println();
+  return WiFi.status() == WL_CONNECTED;
+}
+
+// =====================================================================
+// Mic Sampling
+// =====================================================================
+
+MicStats sampleMic(unsigned long durationMs = MIC_SAMPLE_MS) {
+  MicStats stats = {4095, 0, 0, 0, false, false};
+  long sum = 0; int samples = 0;
+  unsigned long startedAt = millis();
+  while (millis() - startedAt < durationMs) {
+    int analogValue = analogRead(MIC_ANALOG_PIN);
+    stats.minValue = min(stats.minValue, analogValue);
+    stats.maxValue = max(stats.maxValue, analogValue);
+    sum += analogValue; samples++;
+    delayMicroseconds(650);
+  }
+  if (samples > 0) stats.average = sum / samples;
+  stats.peakToPeak = stats.maxValue - stats.minValue;
+  stats.suspicious = stats.average < MIC_VALID_AVG_MIN || stats.average > MIC_VALID_AVG_MAX;
+  stats.loud = stats.peakToPeak >= micThreshold && !stats.suspicious;
+  return stats;
+}
+
+void calibrateMic() {
+  MicStats mic = sampleMic(500);
+  adaptiveNoiseFloor = constrain((float)mic.peakToPeak * 1.2f, 200.0f, (float)NOISE_FLOOR_CAP);
+  micThreshold = max(MIN_CLAP_ABSOLUTE, (int)(adaptiveNoiseFloor * CLAP_RATIO_THRESHOLD));
+  micReady = mic.average >= MIC_VALID_AVG_MIN && mic.average <= MIC_VALID_AVG_MAX;
+  Serial.printf("[mic] avg=%d noiseFloor=%.0f threshold=%d ready=%d\n", mic.average, adaptiveNoiseFloor, micThreshold, micReady);
+}
+
+// =====================================================================
+// IMU Reading
+// =====================================================================
+
+bool readImu(ImuReading& r) {
+  accel->readSensor(); gyro->readSensor();
+  r.ax = accel->getAccelX_mss() - ax0;
+  r.ay = accel->getAccelY_mss() - ay0;
+  r.az = accel->getAccelZ_mss() - az0;
+  r.mag = sqrtf(r.ax * r.ax + r.ay * r.ay + r.az * r.az);
+  r.gxDps = gyro->getGyroX_rads() * RAD_TO_DEG_PER_SEC;
+  r.gyDps = gyro->getGyroY_rads() * RAD_TO_DEG_PER_SEC;
+  r.gzDps = gyro->getGyroZ_rads() * RAD_TO_DEG_PER_SEC;
+  bool valid = isfinite(r.ax) && isfinite(r.ay) && isfinite(r.az) && isfinite(r.gxDps) && isfinite(r.gyDps) && isfinite(r.gzDps);
+  if (!valid) { imuFaultCount++; return false; }
+  imuFaultCount = 0; return true;
+}
+
+float dominantRotationDps(const ImuReading& r) {
+  float rotation = r.gxDps;
+  if (fabsf(r.gyDps) > fabsf(rotation)) rotation = r.gyDps;
+  if (fabsf(r.gzDps) > fabsf(rotation)) rotation = r.gzDps;
+  return rotation;
+}
+
+float gyroMagnitudeDps(const ImuReading& r) {
+  return sqrtf(r.gxDps * r.gxDps + r.gyDps * r.gyDps + r.gzDps * r.gzDps);
+}
+
+float accelDeltaFromPrevious(const ImuReading& r) {
+  if (!hasPreviousReading) return 0.0f;
+  float dx = r.ax - previousReading.ax, dy = r.ay - previousReading.ay, dz = r.az - previousReading.az;
+  return sqrtf(dx * dx + dy * dy + dz * dz);
+}
+
+float accelZDeltaFromPrevious(const ImuReading& r) {
+  return hasPreviousReading ? r.az - previousReading.az : 0.0f;
+}
+
+void rememberImuReading(const ImuReading& r) {
+  previousReading = r; hasPreviousReading = true;
+}
+
+// =====================================================================
+// Gesture Detection
+// =====================================================================
+
+bool detectWake(const ImuReading& r, float accelDelta, float gyroAbs) {
+  if (millis() - lastWakeAt < WAKE_COOLDOWN_MS) return false;
+  wakeHitCount = (accelDelta > WAKE_ACCEL_DELTA_THRESHOLD || gyroAbs > WAKE_GYRO_THRESHOLD_DPS) ? wakeHitCount + 1 : 0;
+  return wakeHitCount >= WAKE_CONFIRM_SAMPLES;
+}
+
+GestureId detectGesture(const ImuReading& r, float accelDelta, float accelZDelta) {
+  if (millis() - lastGestureAt < GESTURE_COOLDOWN_MS) return GESTURE_NONE;
+  if (accelDelta > GESTURE_ACCEL_DELTA_THRESHOLD && accelZDelta > GESTURE_AXIS_DELTA_THRESHOLD) return GESTURE_UP;
+  if (accelDelta > GESTURE_ACCEL_DELTA_THRESHOLD && accelZDelta < -GESTURE_AXIS_DELTA_THRESHOLD) return GESTURE_DOWN;
+  float rotation = dominantRotationDps(r);
+  if (fabsf(rotation) > ROTATION_THRESHOLD_DPS) {
+    bool rotateOut = INVERT_ROTATION_GESTURES ? !(rotation > 0) : (rotation > 0);
+    return rotateOut ? GESTURE_ROTATE_OUT : GESTURE_ROTATE_IN;
+  }
+  return GESTURE_NONE;
+}
+
+// SIMPLE mode detection: quick threshold-based up/down from codigo_funciona_cima.txt
+bool detectSimpleUp(const ImuReading& r) {
+  return (r.az > SIMPLE_CIMA_THRESHOLD_AZ && r.mag > SIMPLE_CIMA_THRESHOLD_MAG);
+}
+
+bool detectSimpleDown(const ImuReading& r) {
+  return (r.az < SIMPLE_BAIXO_THRESHOLD_AZ && r.mag > SIMPLE_BAIXO_THRESHOLD_MAG);
+}
+
+// =====================================================================
+// HTTP POST
+// =====================================================================
+
+bool postSimpleGesture(const char* gesture) {
+  if (WiFi.status() != WL_CONNECTED) {
+    if (!connectWiFi(5000)) return false;
+  }
+  HTTPClient http;
+  http.begin(SERVER_URL);
+  http.addHeader("Content-Type", "application/json");
+  String payload = String("{\"gesto\":\"") + gesture + "\"}";
+  int code = http.POST(payload);
+  Serial.print("Payload enviado: ");
+  Serial.println(payload);
+  Serial.print("HTTP code: ");
+  Serial.println(code);
+  http.end();
+  return code > 0 && code < 400;
+}
+
+bool postFullGesture(const GestureInfo& info, int& httpCode) {
+  httpCode = -1;
+  if (!connectWiFi(5000)) return false;
+  HTTPClient http;
+  http.begin(SERVER_URL);
+  http.addHeader("Content-Type", "application/json");
+  String payload = String("{\"gesto\":\"") + info.payload
+    + "\",\"contexto\":\"" + activeRoom
+    + "\",\"palmas\":" + activeClaps
+    + ",\"acao\":\"" + info.action + "\"}";
+  httpCode = http.POST(payload);
+  Serial.println("[http] POST enviado");
+  http.end();
+  return httpCode > 0 && httpCode < 400;
+}
+
+// =====================================================================
+// E-Paper UI
+// =====================================================================
 
 const int SCR_W = 200;
 const int SCR_H = 200;
 
-// Zona reservada ao indicador "a ouvir" (rodapé), usada para refresh parcial
-const int LISTEN_DOT_Y = 190;
-const int LISTEN_DOT_X0 = 150;
-const int LISTEN_DOT_GAP = 12;
-const int LISTEN_DOT_R = 3;
+void epdFullMode() { M5.Display.setEpdMode(epd_text); }
+void epdFastMode() { M5.Display.setEpdMode(epd_fastest); }
 
-bool listenIndicatorActive = false;
-unsigned long lastListenBlinkAt = 0;
-const unsigned long LISTEN_BLINK_MS = 700;
-
-void epdFullMode() {
-  M5.Display.setEpdMode(epd_text);
-}
-
-void epdFastMode() {
-  M5.Display.setEpdMode(epd_fastest);
-}
-
-// --- Barra de topo invertida (preto com texto branco) ---------------
 void drawTopBar(const char* leftText, const char* rightText = "") {
   M5.Display.fillRect(0, 0, SCR_W, 22, TFT_BLACK);
   M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
@@ -431,7 +437,7 @@ void drawFooterHint(const char* text) {
   M5.Display.print(text);
 }
 
-// --- Ícones simples desenhados por primitivas (18x18, origem em x,y) -
+// --- Icons ---
 void iconArrowUp(int x, int y, bool inverted) {
   uint16_t fg = inverted ? TFT_WHITE : TFT_BLACK;
   M5.Display.fillTriangle(x + 9, y + 2, x + 3, y + 11, x + 15, y + 11, fg);
@@ -467,20 +473,16 @@ void drawGestureIcon(GestureId id, int x, int y, bool inverted) {
   }
 }
 
-// --- Linha de gesto: [icone] NOME ............. acao -----------------
 void drawGestureRow(int y, GestureId id, const char* name, const char* action, bool highlight) {
   const int rowH = 26;
   const int x0 = 6;
   const int rowW = SCR_W - 12;
-
   if (highlight) {
     M5.Display.fillRoundRect(x0, y, rowW, rowH, 3, TFT_BLACK);
   } else {
     M5.Display.drawRoundRect(x0, y, rowW, rowH, 3, TFT_BLACK);
   }
-
   drawGestureIcon(id, x0 + 5, y + 4, highlight);
-
   M5.Display.setTextColor(highlight ? TFT_WHITE : TFT_BLACK, highlight ? TFT_BLACK : TFT_WHITE);
   M5.Display.setTextSize(1);
   M5.Display.setCursor(x0 + 30, y + 4);
@@ -489,39 +491,38 @@ void drawGestureRow(int y, GestureId id, const char* name, const char* action, b
   M5.Display.print(action);
 }
 
-// --- Indicador "a ouvir": 3 pontos, refresh PARCIAL (clipRect) -------
+// --- Listen indicator ---
+const int LISTEN_DOT_Y = 190;
+const int LISTEN_DOT_X0 = 150;
+const int LISTEN_DOT_GAP = 12;
+const int LISTEN_DOT_R = 3;
+bool listenIndicatorActive = false;
+unsigned long lastListenBlinkAt = 0;
+const unsigned long LISTEN_BLINK_MS = 700;
 int listenIndicatorPhase = 0;
 
 void resetListenIndicator() {
-  listenIndicatorActive = false;
-  listenIndicatorPhase = 0;
-  lastListenBlinkAt = 0;
+  listenIndicatorActive = false; listenIndicatorPhase = 0; lastListenBlinkAt = 0;
 }
 
 void drawListenIndicatorFrame() {
-  // Desenhado uma vez junto do resto do ecrã (faz parte do redraw completo)
   for (int i = 0; i < 3; i++) {
     int cx = LISTEN_DOT_X0 + i * LISTEN_DOT_GAP;
     M5.Display.drawCircle(cx, LISTEN_DOT_Y, LISTEN_DOT_R, TFT_BLACK);
   }
 }
 
-// Chamado em loop(), faz só refresh parcial da zona dos pontinhos.
-// Efeito "respiração": acende 1, depois 2, depois 3 pontos, e recomeça.
 void tickListenIndicator() {
   if (appState != STATE_GESTURE) { listenIndicatorActive = false; return; }
   unsigned long now = millis();
   if (listenIndicatorActive && now - lastListenBlinkAt < LISTEN_BLINK_MS) return;
   lastListenBlinkAt = now;
   listenIndicatorActive = true;
-
   listenIndicatorPhase = (listenIndicatorPhase + 1) % 4;
-
   int x0 = LISTEN_DOT_X0 - LISTEN_DOT_R - 1;
   int w = LISTEN_DOT_GAP * 2 + LISTEN_DOT_R * 2 + 2;
   int y0 = LISTEN_DOT_Y - LISTEN_DOT_R - 1;
   int h = LISTEN_DOT_R * 2 + 2;
-
   epdFastMode();
   M5.Display.setClipRect(x0, y0, w, h);
   M5.Display.fillRect(x0, y0, w, h, TFT_WHITE);
@@ -535,7 +536,7 @@ void tickListenIndicator() {
   epdFullMode();
 }
 
-// --- Ecrãs principais --------------------------------------------------
+// --- Screen drawing functions ---
 
 void drawBoot(const char* title, const char* line1 = "", const char* line2 = "") {
   epdFullMode();
@@ -574,12 +575,12 @@ void drawIdle(const char* status = "Mexe o pulso") {
 
   M5.Display.drawLine(0, 145, SCR_W, 145, TFT_BLACK);
   M5.Display.setCursor(8, 155);
-  M5.Display.println("BtnA: recalibrar sensores");
+  M5.Display.println("Btn: recalibrar");
 
-  drawFooterHint("Em repouso");
+  drawFooterHint("Segura btn 2s: teste ML");
 }
 
-void drawContext(const char* status, const MicStats* mic = nullptr) {
+void drawContext(const char* status) {
   epdFullMode();
   M5.Display.fillScreen(TFT_WHITE);
   drawTopBar("A ouvir palmas");
@@ -589,7 +590,6 @@ void drawContext(const char* status, const MicStats* mic = nullptr) {
   M5.Display.setCursor(8, 30);
   M5.Display.print(status);
 
-  // Indicador grande de progresso: 3 caixas, preenchidas conforme clapCount
   const int boxSize = 36;
   const int gap = 10;
   const int totalW = boxSize * 3 + gap * 2;
@@ -602,7 +602,6 @@ void drawContext(const char* status, const MicStats* mic = nullptr) {
     bool filled = i < clapCount;
     if (filled) M5.Display.fillRoundRect(x, boxY, boxSize, boxSize, 4, TFT_BLACK);
     else M5.Display.drawRoundRect(x, boxY, boxSize, boxSize, 4, TFT_BLACK);
-
     M5.Display.setTextColor(filled ? TFT_WHITE : TFT_BLACK, filled ? TFT_BLACK : TFT_WHITE);
     M5.Display.setTextSize(2);
     M5.Display.setCursor(x + boxSize / 2 - 6, boxY + 8);
@@ -621,14 +620,6 @@ void drawContext(const char* status, const MicStats* mic = nullptr) {
   M5.Display.print("Limiar mic: ");
   M5.Display.println(micThreshold);
 
-  if (mic != nullptr) {
-    M5.Display.setCursor(8, 154);
-    M5.Display.print("p2p ");
-    M5.Display.print(mic->peakToPeak);
-    M5.Display.print("  media ");
-    M5.Display.print(mic->average);
-  }
-
   drawFooterHint("Fica quieto entre palmas");
 }
 
@@ -638,7 +629,6 @@ void drawGestureWait() {
 
   char rightLabel[24];
   snprintf(rightLabel, sizeof(rightLabel), "%d palma%s", activeClaps, activeClaps == 1 ? "" : "s");
-  // Etiqueta do contexto em maiúsculas para destaque
   String roomUpper = String(activeRoom);
   roomUpper.toUpperCase();
   drawTopBar(roomUpper.c_str(), rightLabel);
@@ -666,7 +656,6 @@ void drawGestureResult(const GestureInfo& info, bool sent, int httpCode) {
   M5.Display.print("Contexto: ");
   M5.Display.println(activeRoom);
 
-  // Bloco em destaque com o gesto reconhecido
   M5.Display.drawRoundRect(8, 46, SCR_W - 16, 40, 4, TFT_BLACK);
   drawGestureIcon(info.id, 16, 57, false);
   M5.Display.setCursor(42, 56);
@@ -687,59 +676,74 @@ void drawGestureResult(const GestureInfo& info, bool sent, int httpCode) {
   drawFooterHint("A voltar ao inicio...");
 }
 
-bool postGesture(const GestureInfo& info, int& httpCode) {
-  httpCode = -1;
-  if (!connectWiFi(5000)) return false;
-  HTTPClient http; http.begin(SERVER_URL); http.addHeader("Content-Type", "application/json");
-  String payload = String("{\"gesto\":\"") + info.payload + "\",\"contexto\":\"" + activeRoom + "\",\"palmas\":" + activeClaps + ",\"acao\":\"" + info.action + "\"}";
-  httpCode = http.POST(payload);
-  Serial.println("[http] POST enviado"); http.end();
-  return httpCode > 0 && httpCode < 400;
+// =====================================================================
+// ML Test Screen (from teste_ml_gesto_unico.ino)
+// =====================================================================
+
+void drawMsg(const char* title, const char* line1, const char* line2) {
+  M5.Display.setEpdMode(epd_fastest);
+  M5.Display.fillScreen(TFT_WHITE);
+  M5.Display.fillRect(0, 0, 200, 22, TFT_BLACK);
+  M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+  M5.Display.setTextSize(2);
+  M5.Display.setCursor(6, 4);
+  M5.Display.print(title);
+  M5.Display.setTextColor(TFT_BLACK, TFT_WHITE);
+  M5.Display.setTextSize(1);
+  if (line1) { M5.Display.setCursor(8, 40); M5.Display.println(line1); }
+  if (line2) { M5.Display.setCursor(8, 56); M5.Display.println(line2); }
 }
 
-bool readImu(ImuReading& r) {
-  accel->readSensor(); gyro->readSensor();
-  r.ax = accel->getAccelX_mss() - ax0; r.ay = accel->getAccelY_mss() - ay0; r.az = accel->getAccelZ_mss() - az0;
-  r.mag = sqrtf(r.ax * r.ax + r.ay * r.ay + r.az * r.az);
-  r.gxDps = gyro->getGyroX_rads() * RAD_TO_DEG_PER_SEC; r.gyDps = gyro->getGyroY_rads() * RAD_TO_DEG_PER_SEC; r.gzDps = gyro->getGyroZ_rads() * RAD_TO_DEG_PER_SEC;
-  bool valid = isfinite(r.ax) && isfinite(r.ay) && isfinite(r.az) && isfinite(r.gxDps) && isfinite(r.gyDps) && isfinite(r.gzDps);
-  if (!valid) { imuFaultCount++; return false; }
-  imuFaultCount = 0; return true;
-}
+void drawMLResult(ei_impulse_result_t& result, const char* bestLabel, float bestScore,
+                  float peakAccel, float peakGyro) {
+  M5.Display.setEpdMode(epd_text);
+  M5.Display.fillScreen(TFT_WHITE);
 
-float dominantRotationDps(const ImuReading& r) {
-  float rotation = r.gxDps;
-  if (fabsf(r.gyDps) > fabsf(rotation)) rotation = r.gyDps;
-  if (fabsf(r.gzDps) > fabsf(rotation)) rotation = r.gzDps;
-  return rotation;
-}
+  bool confident = bestScore >= ML_CONFIDENCE_OK;
+  M5.Display.fillRect(0, 0, 200, 22, confident ? TFT_BLACK : TFT_WHITE);
+  M5.Display.setTextColor(confident ? TFT_WHITE : TFT_BLACK,
+                           confident ? TFT_BLACK : TFT_WHITE);
+  M5.Display.setTextSize(2);
+  M5.Display.setCursor(6, 4);
+  M5.Display.print(confident ? "ML OK" : "ML baixo");
 
-float gyroMagnitudeDps(const ImuReading& r) { return sqrtf(r.gxDps * r.gxDps + r.gyDps * r.gyDps + r.gzDps * r.gzDps); }
-float accelDeltaFromPrevious(const ImuReading& r) {
-  if (!hasPreviousReading) return 0.0f;
-  float dx = r.ax - previousReading.ax, dy = r.ay - previousReading.ay, dz = r.az - previousReading.az;
-  return sqrtf(dx * dx + dy * dy + dz * dz);
-}
-float accelZDeltaFromPrevious(const ImuReading& r) { return hasPreviousReading ? r.az - previousReading.az : 0.0f; }
-void rememberImuReading(const ImuReading& r) { previousReading = r; hasPreviousReading = true; }
+  M5.Display.fillRoundRect(8, 30, 184, 50, 6, TFT_BLACK);
+  M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+  M5.Display.setTextSize(3);
+  M5.Display.setCursor(20, 44);
+  M5.Display.print(bestLabel);
+  M5.Display.setTextSize(1);
+  M5.Display.setCursor(20, 68);
+  M5.Display.printf("conf: %.0f%%", bestScore * 100.0f);
 
-bool detectWake(const ImuReading& r, float accelDelta, float gyroAbs) {
-  if (millis() - lastWakeAt < WAKE_COOLDOWN_MS) return false;
-  wakeHitCount = (accelDelta > WAKE_ACCEL_DELTA_THRESHOLD || gyroAbs > WAKE_GYRO_THRESHOLD_DPS) ? wakeHitCount + 1 : 0;
-  return wakeHitCount >= WAKE_CONFIRM_SAMPLES;
-}
-
-GestureId detectGesture(const ImuReading& r, float accelDelta, float accelZDelta) {
-  if (millis() - lastGestureAt < GESTURE_COOLDOWN_MS) return GESTURE_NONE;
-  if (accelDelta > GESTURE_ACCEL_DELTA_THRESHOLD && accelZDelta > GESTURE_AXIS_DELTA_THRESHOLD) return GESTURE_UP;
-  if (accelDelta > GESTURE_ACCEL_DELTA_THRESHOLD && accelZDelta < -GESTURE_AXIS_DELTA_THRESHOLD) return GESTURE_DOWN;
-  float rotation = dominantRotationDps(r);
-  if (fabsf(rotation) > ROTATION_THRESHOLD_DPS) {
-    bool rotateOut = INVERT_ROTATION_GESTURES ? !(rotation > 0) : (rotation > 0);
-    return rotateOut ? GESTURE_ROTATE_OUT : GESTURE_ROTATE_IN;
+  M5.Display.setTextColor(TFT_BLACK, TFT_WHITE);
+  M5.Display.setTextSize(1);
+  M5.Display.setCursor(8, 92);
+  M5.Display.println("Scores ML:");
+  for (int i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+    int y = 106 + i * 16;
+    float score = result.classification[i].value;
+    const char* lbl = result.classification[i].label;
+    int barLen = (int)(score * 130.0f);
+    M5.Display.fillRect(8, y + 8, barLen, 6, TFT_BLACK);
+    M5.Display.drawRect(8, y + 8, 130, 6, TFT_BLACK);
+    M5.Display.setCursor(144, y + 4);
+    M5.Display.printf("%s %.2f", lbl, score);
   }
-  return GESTURE_NONE;
+
+  int diagY = 108 + EI_CLASSIFIER_LABEL_COUNT * 16 + 8;
+  M5.Display.drawLine(0, diagY, 200, diagY, TFT_BLACK);
+  M5.Display.setCursor(8, diagY + 6);
+  M5.Display.printf("pico accel: %.2f m/s2", peakAccel);
+  M5.Display.setCursor(8, diagY + 20);
+  M5.Display.printf("pico gyro:  %.1f dps", peakGyro);
+  M5.Display.setCursor(8, diagY + 36);
+  M5.Display.println("A voltar...");
 }
+
+// =====================================================================
+// State Machine Functions
+// =====================================================================
 
 void goIdle(const char* status) {
   appState = STATE_IDLE; stateStartedAt = millis();
@@ -762,8 +766,6 @@ void finalizeContext() {
   drawGestureWait();
 }
 
-// Envia dados para o Serial Plotter (throttled a 50ms)
-// Mostra: P2P do mic, média do ADC E o limiar adaptativo (para ver como reage à conversa)
 void printPlotter(int p2p, int avg, int threshold) {
   if (millis() - lastPlotterAt < 50) return;
   lastPlotterAt = millis();
@@ -772,59 +774,14 @@ void printPlotter(int p2p, int avg, int threshold) {
   Serial.print(",Limiar_Adapt:"); Serial.println(threshold);
 }
 
-MicStats sampleMic(unsigned long durationMs = MIC_SAMPLE_MS) {
-  MicStats stats = {4095, 0, 0, 0, false, false};
-  long sum = 0; int samples = 0;
-  unsigned long startedAt = millis();
-  while (millis() - startedAt < durationMs) {
-    int analogValue = analogRead(MIC_ANALOG_PIN);
-    stats.minValue = min(stats.minValue, analogValue);
-    stats.maxValue = max(stats.maxValue, analogValue);
-    sum += analogValue; samples++;
-    delayMicroseconds(650);
-  }
-  if (samples > 0) stats.average = sum / samples;
-  stats.peakToPeak = stats.maxValue - stats.minValue;
-  stats.suspicious = stats.average < MIC_VALID_AVG_MIN || stats.average > MIC_VALID_AVG_MAX;
-  stats.loud = stats.peakToPeak >= micThreshold && !stats.suspicious;
-  return stats;
-}
-
-void calibrateMic() {
-  drawBoot("Calibrar MIC", "A afinar sensor...", "A aguardar...");
-
-  // Lemos o microfone apenas para saber se o cabo está bem ligado (média dos ~2000)
-  // Usamos uma janela maior para melhor estimativa do ruído de fundo inicial
-  MicStats mic = sampleMic(500);
-
-  // Inicializar o piso adaptativo com o ruído medido agora (+ 20% de margem)
-  // Isto garante que o sistema começa calibrado ao ambiente atual
-  adaptiveNoiseFloor = constrain((float)mic.peakToPeak * 1.2f, 200.0f, (float)NOISE_FLOOR_CAP);
-
-  // Calcular limiar inicial a partir do piso adaptativo
-  micThreshold = max(MIN_CLAP_ABSOLUTE, (int)(adaptiveNoiseFloor * CLAP_RATIO_THRESHOLD));
-
-  micReady = mic.average >= MIC_VALID_AVG_MIN && mic.average <= MIC_VALID_AVG_MAX;
-
-  Serial.printf("[mic] avg=%d noiseFloor=%.0f threshold=%d ready=%d\n", mic.average, adaptiveNoiseFloor, micThreshold, micReady);
-}
-
 void processContext() {
   unsigned long now = millis();
 
-  // Fecho por Timeout Geral
   if (clapCount == 0 && now - stateStartedAt > CONTEXT_WAIT_TIMEOUT_MS) { goIdle("Sem palmas"); return; }
 
-  // Fecho por Janela Concluída (Só ativa se já houver palmas)
   if (clapCount > 0) {
-    if (now - lastClapAt > CLAP_GAP_MS) {
-        Serial.printf("[debug] Janela de %dms sem palmas concluida. A avançar...\n", CLAP_GAP_MS);
-        finalizeContext(); return;
-    }
-    if (now - firstClapAt > CONTEXT_WINDOW_MS) {
-        Serial.println("[debug] Tempo limite de contexto atingido. A avançar...");
-        finalizeContext(); return;
-    }
+    if (now - lastClapAt > CLAP_GAP_MS) { finalizeContext(); return; }
+    if (now - firstClapAt > CONTEXT_WINDOW_MS) { finalizeContext(); return; }
   }
 
   if (now - stateStartedAt < MIC_SETTLE_AFTER_WAKE_MS) return;
@@ -832,50 +789,26 @@ void processContext() {
   lastMicSampleAt = now;
 
   MicStats mic = sampleMic(MIC_SAMPLE_MS);
-
-  // === LIMIAR ADAPTATIVO ===
-  // O limiar é calculado em tempo real: 2.8x acima do piso de ruído atual,
-  // com um mínimo absoluto para evitar falsos positivos em silêncio total.
   int dynamicThreshold = max(MIN_CLAP_ABSOLUTE, (int)(adaptiveNoiseFloor * CLAP_RATIO_THRESHOLD));
-  micThreshold = dynamicThreshold; // atualizar o display
-
-  // Enviar para o Serial Plotter (inclui o limiar para ver a adaptação)
+  micThreshold = dynamicThreshold;
   printPlotter(mic.peakToPeak, mic.average, dynamicThreshold);
 
-  // Uma palma "real" é aquela que ultrapassa o limiar dinâmico (não o fixo)
   bool isClap = mic.peakToPeak >= dynamicThreshold && !mic.suspicious;
 
-  // Atualizar o piso de ruído APENAS quando NÃO é palma
-  // → sobe rápido (para acompanhar conversa), desce devagar (retorno ao silêncio)
   if (!isClap && !mic.suspicious) {
     float alpha = (mic.peakToPeak > adaptiveNoiseFloor) ? NOISE_RISE_ALPHA : NOISE_FALL_ALPHA;
     adaptiveNoiseFloor = alpha * (float)mic.peakToPeak + (1.0f - alpha) * adaptiveNoiseFloor;
     adaptiveNoiseFloor = constrain(adaptiveNoiseFloor, 0.0f, (float)NOISE_FLOOR_CAP);
   }
 
-  if (mic.peakToPeak > dynamicThreshold / 2) {
-      Serial.printf("[mic-debug] Som captado: p2p=%d (limiar_adapt=%d noiseFloor=%.0f) avg=%d isClap=%d\n",
-                    mic.peakToPeak, dynamicThreshold, adaptiveNoiseFloor, mic.average, isClap);
-  }
-
   if (mic.suspicious) return;
 
   if (isClap) {
-    if (now - lastClapAt < CLAP_DEBOUNCE_MS) {
-        Serial.println("[mic-debug] -> Ignorado: Palma demasiado rapida (Debounce)");
-        return;
-    }
-
+    if (now - lastClapAt < CLAP_DEBOUNCE_MS) return;
     if (clapCount == 0) firstClapAt = now;
     lastClapAt = now;
     clapCount = min(clapCount + 1, MAX_CONTEXT_CLAPS);
-
-    Serial.printf("\n====================================\n");
-    Serial.printf(" 👏 PALMA CONFIRMADA: %d\n", clapCount);
-    Serial.printf("====================================\n\n");
-
-    //drawContext("Palma detetada", &mic);
-
+    Serial.printf("\n PALMA CONFIRMADA: %d\n", clapCount);
     if (clapCount >= MAX_CONTEXT_CLAPS) finalizeContext();
   }
 }
@@ -884,10 +817,12 @@ void processGesture(const ImuReading& reading, float accelDelta, float accelZDel
   if (millis() - stateStartedAt > GESTURE_WINDOW_MS) { goIdle("Sem gesto"); return; }
   GestureId gestureId = detectGesture(reading, accelDelta, accelZDelta);
   if (gestureId == GESTURE_NONE) return;
-  lastGestureAt = millis(); GestureInfo info = gestureInfo(gestureId);
+  lastGestureAt = millis();
+  GestureInfo info = gestureInfo(gestureId);
   Serial.printf("[gesture] Gesto enviado: %s\n", info.payload);
   drawBoot("Enviar", info.title, activeRoom);
-  int httpCode = -1; bool sent = postGesture(info, httpCode);
+  int httpCode = -1;
+  bool sent = postFullGesture(info, httpCode);
   drawGestureResult(info, sent, httpCode);
   appState = STATE_RESULT; returnToIdleAt = millis() + RESULT_RETURN_MS;
 }
@@ -898,187 +833,40 @@ void recoverImuIfNeeded() {
   if (imuReady) { calibrateZero(); goIdle("IMU recuperado"); }
 }
 
-void handleButtons() {
-  if (!M5.BtnA.wasPressed()) return;
-  Serial.println("\n[btn] Recalibrar sensores forçado");
-  calibrateZero(); calibrateMic(); goIdle("Sensores calibrados");
-}
-
 void maybeReturnToIdle() {
   if (appState != STATE_RESULT || returnToIdleAt == 0) return;
   if (millis() >= returnToIdleAt) goIdle("Mexe o pulso");
 }
 
 void printImuStatus(const ImuReading& r, float accelDelta, float gyroAbs) {
-  if (appState == STATE_CONTEXT) return; // Nao fazer spam do IMU enquanto lemos palmas
+  if (appState == STATE_CONTEXT) return;
   if (millis() - lastImuSerialAt < 1000) return;
   lastImuSerialAt = millis();
   Serial.printf("[imu] dA=%.2f gAbs=%.1f\n", accelDelta, gyroAbs);
 }
 
-void setup() {
-  auto cfg = M5.config(); cfg.clear_display = true; M5.begin(cfg);
-  Serial.begin(115200); delay(500); M5.Display.setRotation(0);
-  if (M5.Display.isEPD()) M5.Display.setColorDepth(8);
-  epdFullMode();
-  pinMode(MIC_ANALOG_PIN, INPUT); analogReadResolution(12); analogSetPinAttenuation(MIC_ANALOG_PIN, ADC_11db);
-  imuReady = initImu();
-  if (!imuReady) while (true) delay(1000);
-  calibrateZero(); calibrateMic();
-  connectWiFi(); goIdle(WiFi.status() == WL_CONNECTED ? "Pronto" : "Sem WiFi");
-}
-
-void loop() {
-  M5.update(); handleButtons(); maybeReturnToIdle();
-  ImuReading reading;
-  if (!readImu(reading)) { recoverImuIfNeeded(); delay(50); return; }
-
-  float accelDelta = accelDeltaFromPrevious(reading);
-  float accelZDelta = accelZDeltaFromPrevious(reading);
-  float gyroAbs = gyroMagnitudeDps(reading);
-
-  printImuStatus(reading, accelDelta, gyroAbs);
-
-  switch (appState) {
-    case STATE_IDLE: if (detectWake(reading, accelDelta, gyroAbs)) startContext(); break;
-    case STATE_CONTEXT: processContext(); break;
-    case STATE_GESTURE: processGesture(reading, accelDelta, accelZDelta); break;
-    case STATE_RESULT: default: break;
-  }
-  rememberImuReading(reading);
-
-  // UI: pisca o indicador "a ouvir" só com refresh parcial (não afeta deteção)
-  tickListenIndicator();
-
-  // Amostragem dinâmica para evitar os tais pontos cegos!
-  if (appState == STATE_CONTEXT) {
-     delay(2);
-  } else {
-     delay(30);
-  }
-}
-
 // =====================================================================
-// ========================  MODE: ML TEST  ============================
+// ML Test — from teste_ml_gesto_unico.ino, adapted to run on demand
 // =====================================================================
-#elif ACTIVE_MODE == MODE_ML_TEST
 
-// --- Pinos I2C (mesmos do sketch principal) ---
-// (já definidos globalmente: I2C_PRIMARY_SDA, I2C_PRIMARY_SCL, etc.)
+void runMLDiagnostic() {
+  appState = STATE_ML_TEST;
 
-// Tempo de preparação antes do "JA!" (não faças o gesto durante este tempo)
-const unsigned long PRE_CAPTURE_MS = 1000;
-
-// Confiança mínima — só para colorir o resultado
-const float CONFIDENCE_OK = 0.65f;
-
-// =====================================================================
-// UI — CoreInk (e-paper 200×200)
-// =====================================================================
-void drawMsg(const char* title, const char* line1, const char* line2) {
-  M5.Display.setEpdMode(epd_fastest);
-  M5.Display.fillScreen(TFT_WHITE);
-  M5.Display.fillRect(0, 0, 200, 22, TFT_BLACK);
-  M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
-  M5.Display.setTextSize(2);
-  M5.Display.setCursor(6, 4);
-  M5.Display.print(title);
-
-  M5.Display.setTextColor(TFT_BLACK, TFT_WHITE);
-  M5.Display.setTextSize(1);
-  if (line1) { M5.Display.setCursor(8, 40); M5.Display.println(line1); }
-  if (line2) { M5.Display.setCursor(8, 56); M5.Display.println(line2); }
-}
-
-void drawResult(ei_impulse_result_t& result, const char* bestLabel, float bestScore,
-                float peakAccel, float peakGyro) {
-  M5.Display.setEpdMode(epd_text);
-  M5.Display.fillScreen(TFT_WHITE);
-
-  bool confident = bestScore >= CONFIDENCE_OK;
-  M5.Display.fillRect(0, 0, 200, 22, confident ? TFT_BLACK : TFT_WHITE);
-  M5.Display.setTextColor(confident ? TFT_WHITE : TFT_BLACK,
-                           confident ? TFT_BLACK : TFT_WHITE);
-  M5.Display.setTextSize(2);
-  M5.Display.setCursor(6, 4);
-  M5.Display.print(confident ? "OK" : "?? baixo");
-
-  // Resultado em destaque (grande, no centro)
-  M5.Display.fillRoundRect(8, 30, 184, 50, 6, TFT_BLACK);
-  M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
-  M5.Display.setTextSize(3);
-  M5.Display.setCursor(20, 44);
-  M5.Display.print(bestLabel);
-  M5.Display.setTextSize(1);
-  M5.Display.setCursor(20, 68);
-  M5.Display.printf("confianca: %.0f%%", bestScore * 100.0f);
-
-  // Scores de todas as labels
-  M5.Display.setTextColor(TFT_BLACK, TFT_WHITE);
-  M5.Display.setTextSize(1);
-  M5.Display.setCursor(8, 92);
-  M5.Display.println("Scores:");
-  for (int i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
-    int y = 106 + i * 16;
-    float score = result.classification[i].value;
-    const char* lbl = result.classification[i].label;
-    int barLen = (int)(score * 130.0f);
-    M5.Display.fillRect(8, y + 8, barLen, 6, TFT_BLACK);
-    M5.Display.drawRect(8, y + 8, 130, 6, TFT_BLACK);
-    M5.Display.setCursor(144, y + 4);
-    M5.Display.printf("%s %.2f", lbl, score);
-  }
-
-  int diagY = 108 + EI_CLASSIFIER_LABEL_COUNT * 16 + 8;
-  M5.Display.drawLine(0, diagY, 200, diagY, TFT_BLACK);
-  M5.Display.setCursor(8, diagY + 6);
-  M5.Display.printf("pico accel: %.2f m/s2", peakAccel);
-  M5.Display.setCursor(8, diagY + 20);
-  M5.Display.printf("pico gyro:  %.1f dps", peakGyro);
-  M5.Display.setCursor(8, diagY + 36);
-  M5.Display.println("Reset para repetir o teste.");
-}
-
-// =====================================================================
-// Setup — faz TUDO uma vez: calibra, avisa, recolhe, classifica, mostra
-// =====================================================================
-void setup() {
-  auto cfg = M5.config();
-  cfg.clear_display = true;
-  M5.begin(cfg);
-  Serial.begin(115200);
-  delay(500);
-
-  M5.Display.setRotation(0);
-  if (M5.Display.isEPD()) M5.Display.setColorDepth(8);
-  M5.Display.setEpdMode(epd_text);
-
-  Serial.println("\n========================================");
-  Serial.println("  Teste ML (gesto unico) — correia_2k-project-1");
-  Serial.println("========================================");
+  drawMsg("Teste ML", "Prepara...", "Vai comecar!");
+  Serial.println("\n===== ML Diagnostic Test =====");
   Serial.printf("  Labels: %d\n", EI_CLASSIFIER_LABEL_COUNT);
   for (int i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
     Serial.printf("  [%d] %s\n", i, ei_classifier_inferencing_categories[i]);
   }
 
-  // --- Iniciar IMU (shared initImu) ---
-  drawMsg("Teste ML", "A iniciar IMU...", nullptr);
-  if (!initImu()) {
-    drawMsg("ERRO", "IMU nao encontrado!", "Verifica cabos I2C.");
-    Serial.println("[ERRO] IMU nao encontrado. Verifica cabos I2C.");
-    while (true) delay(1000);
-  }
-
-  // --- Preparação: 1s de aviso ANTES do gesto ---
+  // Wait and prompt user
   drawMsg("PREPARA", "Aguarda... NAO faças", "o gesto ainda.");
-  Serial.println("[info] Prepara o pulso. Gesto comeca quando aparecer JA!");
   delay(PRE_CAPTURE_MS);
 
-  // --- Sinal único: JA! Faz o gesto agora ---
   drawMsg("JA!", "Faz o gesto", "UMA VEZ, agora!");
-  Serial.println("[info] JA! -> recolha a comecar.");
+  Serial.println("[ml] JA! -> recolha a comecar.");
 
-  // --- Recolha de 1s a 100Hz ---
+  // Capture 1s at 100Hz (same as original ML test)
   const int numSamples = EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE / 6;
   static float buffer[EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE];
 
@@ -1094,9 +882,9 @@ void setup() {
     float ax = accel->getAccelX_mss();
     float ay = accel->getAccelY_mss();
     float az = accel->getAccelZ_mss();
-    float gx = gyro->getGyroX_rads() * RAD_TO_DEG;
-    float gy = gyro->getGyroY_rads() * RAD_TO_DEG;
-    float gz = gyro->getGyroZ_rads() * RAD_TO_DEG;
+    float gx = gyro->getGyroX_rads() * RAD_TO_DEG_PER_SEC;
+    float gy = gyro->getGyroY_rads() * RAD_TO_DEG_PER_SEC;
+    float gz = gyro->getGyroZ_rads() * RAD_TO_DEG_PER_SEC;
 
     buffer[base + 0] = ax;
     buffer[base + 1] = ay;
@@ -1117,7 +905,7 @@ void setup() {
   Serial.println("[ok] Recolha concluida (1s).");
   Serial.printf("  Pico accel: %.3f m/s2  |  Pico gyro: %.1f dps\n", peakAccel, peakGyro);
 
-  // --- Inferência ---
+  // Run inference
   drawMsg("A pensar...", "A classificar o gesto", nullptr);
   Serial.println("[ml] A correr classificador...");
 
@@ -1126,6 +914,8 @@ void setup() {
   if (sigErr != 0) {
     drawMsg("ERRO", "signal_from_buffer falhou", nullptr);
     Serial.printf("[ml] ERRO signal_from_buffer: %d\n", sigErr);
+    delay(3000);
+    goIdle("ML erro");
     return;
   }
 
@@ -1134,10 +924,12 @@ void setup() {
   if (status != EI_IMPULSE_OK) {
     drawMsg("ERRO", "run_classifier falhou", nullptr);
     Serial.printf("[ml] ERRO run_classifier: %d\n", (int)status);
+    delay(3000);
+    goIdle("ML erro");
     return;
   }
 
-  // --- Resultados ---
+  // Parse results
   float bestScore = 0.0f;
   int   bestIdx   = 0;
   Serial.println("[ml] Resultados:");
@@ -1145,34 +937,168 @@ void setup() {
     float s = result.classification[i].value;
     const char* l = result.classification[i].label;
     Serial.printf("     %-10s %.4f  %s\n", l, s,
-                  s >= CONFIDENCE_OK ? "<-- ACIMA LIMIAR" : "");
+                  s >= ML_CONFIDENCE_OK ? "<-- ACIMA LIMIAR" : "");
     if (s > bestScore) { bestScore = s; bestIdx = i; }
   }
 
   if (peakAccel < 5.0f) {
-    Serial.println("[AVISO] Pico de accel muito baixo (<5 m/s2). Sensor pode nao estar a ler bem.");
+    Serial.println("[AVISO] Pico de accel muito baixo (<5 m/s2).");
   }
-  if (bestScore < CONFIDENCE_OK) {
+  if (bestScore < ML_CONFIDENCE_OK) {
     Serial.printf("[AVISO] Confianca baixa (%.2f).\n", bestScore);
   }
 
   const char* bestLabel = result.classification[bestIdx].label;
-  Serial.printf("\n>>> RESULTADO: %s (%.0f%%) <<<\n\n", bestLabel, bestScore * 100.0f);
+  Serial.printf("\n>>> RESULTADO ML: %s (%.0f%%) <<<\n\n", bestLabel, bestScore * 100.0f);
 
-  drawResult(result, bestLabel, bestScore, peakAccel, peakGyro);
+  drawMLResult(result, bestLabel, bestScore, peakAccel, peakGyro);
+
+  // Show result for 5 seconds, then return to idle
+  delay(5000);
+  goIdle("ML completo");
 }
 
 // =====================================================================
-// Loop — não faz nada; é um teste de UM ÚNICO gesto.
-// Para repetir, faz reset ao dispositivo (botão de reset ou desliga/liga).
+// Button Handling
 // =====================================================================
+
+void handleButton() {
+  M5.update();
+
+  if (M5.BtnA.wasHold()) {
+    // Button was held for >= 500ms (default hold threshold)
+    if (!btnHeld && appState == STATE_IDLE) {
+      btnHeld = true;
+      Serial.println("[btn] Hold detectado! A iniciar teste ML...");
+      runMLDiagnostic();
+    }
+    return;
+  }
+
+  if (M5.BtnA.wasPressed()) {
+    // Short press — recalibrate (only in IDLE or RESULT)
+    if (appState == STATE_IDLE || appState == STATE_RESULT) {
+      Serial.println("\n[btn] Recalibrar sensores");
+      calibrateZero();
+      calibrateMic();
+      goIdle("Sensores calibrados");
+    }
+    return;
+  }
+
+  // Reset hold state when button is released
+  if (btnHeld && !M5.BtnA.isPressed()) {
+    btnHeld = false;
+  }
+}
+
+// =====================================================================
+// setup()
+// =====================================================================
+
+void setup() {
+  auto cfg = M5.config(); cfg.clear_display = true; M5.begin(cfg);
+  Serial.begin(115200); delay(500); M5.Display.setRotation(0);
+  if (M5.Display.isEPD()) M5.Display.setColorDepth(8);
+  epdFullMode();
+
+  pinMode(MIC_ANALOG_PIN, INPUT);
+  analogReadResolution(12);
+  analogSetPinAttenuation(MIC_ANALOG_PIN, ADC_11db);
+
+  // Configure button hold time (long press detection)
+  M5.BtnA.setHoldThresh(2000);  // 2 seconds for hold
+
+  drawBoot("OmniBand", "A iniciar IMU...", "");
+  imuReady = initImu();
+  if (!imuReady) {
+    drawBoot("ERRO", "IMU nao encontrado!", "Verifica I2C.");
+    while (true) delay(1000);
+  }
+
+  drawBoot("OmniBand", "A calibrar...", "");
+  calibrateZero();
+  calibrateMic();
+  connectWiFi();
+
+  goIdle(WiFi.status() == WL_CONNECTED ? "Pronto" : "Sem WiFi");
+}
+
+// =====================================================================
+// loop() — Integrated main loop
+// =====================================================================
+
 void loop() {
-  delay(1000);
-}
+  handleButton();
 
-// =====================================================================
-// Fallback — unknown mode
-// =====================================================================
-#else
-#error "Unknown ACTIVE_MODE defined. Use MODE_SIMPLE, MODE_FULL, or MODE_ML_TEST."
-#endif
+  // If in ML test mode, do nothing (ML runs in its own blocking flow)
+  if (appState == STATE_ML_TEST) {
+    delay(100);
+    return;
+  }
+
+  maybeReturnToIdle();
+
+  ImuReading reading;
+  if (!readImu(reading)) { recoverImuIfNeeded(); delay(50); return; }
+
+  float accelDelta = accelDeltaFromPrevious(reading);
+  float accelZDelta = accelZDeltaFromPrevious(reading);
+  float gyroAbs = gyroMagnitudeDps(reading);
+
+  printImuStatus(reading, accelDelta, gyroAbs);
+
+  // ===================================================================
+  // SIMPLE MODE INTEGRATION:
+  // In IDLE state, also check for simple threshold gestures.
+  // If detected, send quick command without context.
+  // This integrates codigo_funciona_cima.txt into the same loop.
+  // ===================================================================
+  if (appState == STATE_IDLE) {
+    if (millis() - simpleLastSend > SIMPLE_COOLDOWN_MS) {
+      if (detectSimpleUp(reading)) {
+        Serial.println("Gesto Cima (simples) detetado");
+        if (postSimpleGesture("Cima")) {
+          simpleLastSend = millis();
+        }
+      } else if (detectSimpleDown(reading)) {
+        Serial.println("Gesto Baixo (simples) detetado");
+        if (postSimpleGesture("Baixo")) {
+          simpleLastSend = millis();
+        }
+      }
+    }
+
+    // Also check for wake gesture (full mode)
+    if (detectWake(reading, accelDelta, gyroAbs)) {
+      startContext();
+    }
+  }
+
+  // ===================================================================
+  // FULL STATE MACHINE
+  // ===================================================================
+  switch (appState) {
+    case STATE_CONTEXT:
+      processContext();
+      break;
+    case STATE_GESTURE:
+      processGesture(reading, accelDelta, accelZDelta);
+      break;
+    case STATE_RESULT:
+    default:
+      break;
+  }
+
+  rememberImuReading(reading);
+
+  // UI indicator
+  tickListenIndicator();
+
+  // Dynamic delay
+  if (appState == STATE_CONTEXT) {
+    delay(2);
+  } else {
+    delay(30);
+  }
+}
