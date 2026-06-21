@@ -1,16 +1,12 @@
 // =====================================================================
-// OmniBand_Unified.ino
+// OmniBand_Unified.ino — FINAL VERSION
 // =====================================================================
 // Fully integrated firmware combining:
-//   1. Simple threshold-based gesture detection (codigo_funciona_cima.txt)
-//   2. Full state machine: wake + clap context + 4 gestures (Menu_bonito_palmas.ino)
-//   3. ML classifier inference via Edge Impulse (teste_ml_gesto_unico.ino)
-//
-// How it works:
-//   - Normal operation: full state machine (IDLE → CONTEXT → GESTURE → RESULT)
-//   - In IDLE state, simple threshold gestures (Cima/Baixo) also trigger quick actions
-//   - Press BtnA briefly: recalibrate sensors
-//   - Press and hold BtnA (>2s): run ML diagnostic test (capture → classify → display)
+//   1. Wake gesture → clap context → ML gesture classification
+//   2. 1-second IMU capture + Edge Impulse inference
+//   3. Retry logic if gesture is "parado" or low confidence
+//   4. Simple threshold gestures as quick fallback in IDLE
+//   5. Full e-paper UI with icons, clap progress, ML results
 // =====================================================================
 
 #include <M5Unified.h>
@@ -22,7 +18,7 @@
 #include <correia_2k-project-1_inferencing.h>
 
 // =====================================================================
-// WiFi & Server Configuration
+// WiFi & Server Configuration — CHANGE THESE TO MATCH YOUR NETWORK
 // =====================================================================
 const char* WIFI_SSID = "CasaLt33";
 const char* WIFI_PASS = "luisdiogo";
@@ -76,36 +72,32 @@ const unsigned long CONTEXT_WAIT_TIMEOUT_MS = 10000;
 const int MAX_CONTEXT_CLAPS = 3;
 
 // =====================================================================
-// GESTURE — IMU Thresholds
+// GESTURE — Constants
 // =====================================================================
-// SIMPLE mode thresholds (always-on quick gestures)
+// Simple threshold fallback (quick up/down in IDLE)
 const float SIMPLE_CIMA_THRESHOLD_AZ = 6.0f;
 const float SIMPLE_CIMA_THRESHOLD_MAG = 7.0f;
 const float SIMPLE_BAIXO_THRESHOLD_AZ = -6.0f;
 const float SIMPLE_BAIXO_THRESHOLD_MAG = 7.0f;
 const unsigned long SIMPLE_COOLDOWN_MS = 1500;
 
-// FULL mode thresholds
+// Wake detection
 const float WAKE_ACCEL_DELTA_THRESHOLD = 3.0f;
 const float WAKE_GYRO_THRESHOLD_DPS = 150.0f;
 const unsigned long WAKE_COOLDOWN_MS = 1200;
 const int WAKE_CONFIRM_SAMPLES = 2;
 
-const float GESTURE_ACCEL_DELTA_THRESHOLD = 5.0f;
-const float GESTURE_AXIS_DELTA_THRESHOLD = 4.5f;
-const float ROTATION_THRESHOLD_DPS = 250.0f;
+// Rotation detection (used only for fallback simple mode)
 const float RAD_TO_DEG_PER_SEC = 57.2957795f;
-const unsigned long GESTURE_WINDOW_MS = 9000;
-const unsigned long GESTURE_COOLDOWN_MS = 1500;
-const unsigned long RESULT_RETURN_MS = 3000;
-const bool INVERT_ROTATION_GESTURES = false;
 
-// =====================================================================
-// ML test constants
-// =====================================================================
+// ML capture constants
 const unsigned long PRE_CAPTURE_MS = 1000;
 const float ML_CONFIDENCE_OK = 0.65f;
-const unsigned long BTN_HOLD_MS = 2000;  // Hold button for 2s to enter ML test
+
+// State machine
+const unsigned long GESTURE_WINDOW_MS = 9000;
+const unsigned long GESTURE_COOLDOWN_MS = 1500;
+const unsigned long RESULT_RETURN_MS = 5000; // Show result for 5s
 
 // =====================================================================
 // State Variables
@@ -116,7 +108,6 @@ int micThreshold = AUDIO_PULSE_THRESHOLD;
 float adaptiveNoiseFloor = 350.0f;
 unsigned long lastPlotterAt = 0;
 
-// Full state machine
 unsigned long lastWakeAt = 0;
 unsigned long lastGestureAt = 0;
 unsigned long lastImuSerialAt = 0;
@@ -125,7 +116,6 @@ unsigned long stateStartedAt = 0;
 unsigned long firstClapAt = 0;
 unsigned long lastClapAt = 0;
 unsigned long returnToIdleAt = 0;
-unsigned long btnPressStartedAt = 0;
 bool btnHeld = false;
 
 int clapCount = 0;
@@ -141,8 +131,7 @@ enum AppState {
   STATE_IDLE,
   STATE_CONTEXT,
   STATE_GESTURE,
-  STATE_RESULT,
-  STATE_ML_TEST     // ML diagnostic mode
+  STATE_RESULT
 };
 
 enum GestureId {
@@ -312,13 +301,6 @@ bool readImu(ImuReading& r) {
   imuFaultCount = 0; return true;
 }
 
-float dominantRotationDps(const ImuReading& r) {
-  float rotation = r.gxDps;
-  if (fabsf(r.gyDps) > fabsf(rotation)) rotation = r.gyDps;
-  if (fabsf(r.gzDps) > fabsf(rotation)) rotation = r.gzDps;
-  return rotation;
-}
-
 float gyroMagnitudeDps(const ImuReading& r) {
   return sqrtf(r.gxDps * r.gxDps + r.gyDps * r.gyDps + r.gzDps * r.gzDps);
 }
@@ -338,7 +320,7 @@ void rememberImuReading(const ImuReading& r) {
 }
 
 // =====================================================================
-// Gesture Detection
+// Gesture Detection — Wake only (no more threshold gestures in main path)
 // =====================================================================
 
 bool detectWake(const ImuReading& r, float accelDelta, float gyroAbs) {
@@ -347,19 +329,7 @@ bool detectWake(const ImuReading& r, float accelDelta, float gyroAbs) {
   return wakeHitCount >= WAKE_CONFIRM_SAMPLES;
 }
 
-GestureId detectGesture(const ImuReading& r, float accelDelta, float accelZDelta) {
-  if (millis() - lastGestureAt < GESTURE_COOLDOWN_MS) return GESTURE_NONE;
-  if (accelDelta > GESTURE_ACCEL_DELTA_THRESHOLD && accelZDelta > GESTURE_AXIS_DELTA_THRESHOLD) return GESTURE_UP;
-  if (accelDelta > GESTURE_ACCEL_DELTA_THRESHOLD && accelZDelta < -GESTURE_AXIS_DELTA_THRESHOLD) return GESTURE_DOWN;
-  float rotation = dominantRotationDps(r);
-  if (fabsf(rotation) > ROTATION_THRESHOLD_DPS) {
-    bool rotateOut = INVERT_ROTATION_GESTURES ? !(rotation > 0) : (rotation > 0);
-    return rotateOut ? GESTURE_ROTATE_OUT : GESTURE_ROTATE_IN;
-  }
-  return GESTURE_NONE;
-}
-
-// SIMPLE mode detection: quick threshold-based up/down from codigo_funciona_cima.txt
+// Simple threshold detection (fallback quick gestures in IDLE, from codigo_funciona_cima.txt)
 bool detectSimpleUp(const ImuReading& r) {
   return (r.az > SIMPLE_CIMA_THRESHOLD_AZ && r.mag > SIMPLE_CIMA_THRESHOLD_MAG);
 }
@@ -389,7 +359,7 @@ bool postSimpleGesture(const char* gesture) {
   return code > 0 && code < 400;
 }
 
-bool postFullGesture(const GestureInfo& info, int& httpCode) {
+bool postGesture(const GestureInfo& info, int& httpCode) {
   httpCode = -1;
   if (!connectWiFi(5000)) return false;
   HTTPClient http;
@@ -400,7 +370,7 @@ bool postFullGesture(const GestureInfo& info, int& httpCode) {
     + "\",\"palmas\":" + activeClaps
     + ",\"acao\":\"" + info.action + "\"}";
   httpCode = http.POST(payload);
-  Serial.println("[http] POST enviado");
+  Serial.println("[http] POST: " + payload);
   http.end();
   return httpCode > 0 && httpCode < 400;
 }
@@ -577,7 +547,7 @@ void drawIdle(const char* status = "Mexe o pulso") {
   M5.Display.setCursor(8, 155);
   M5.Display.println("Btn: recalibrar");
 
-  drawFooterHint("Segura btn 2s: teste ML");
+  drawFooterHint("Em repouso");
 }
 
 void drawContext(const char* status) {
@@ -676,10 +646,7 @@ void drawGestureResult(const GestureInfo& info, bool sent, int httpCode) {
   drawFooterHint("A voltar ao inicio...");
 }
 
-// =====================================================================
-// ML Test Screen (from teste_ml_gesto_unico.ino)
-// =====================================================================
-
+// ML test screen
 void drawMsg(const char* title, const char* line1, const char* line2) {
   M5.Display.setEpdMode(epd_fastest);
   M5.Display.fillScreen(TFT_WHITE);
@@ -692,53 +659,6 @@ void drawMsg(const char* title, const char* line1, const char* line2) {
   M5.Display.setTextSize(1);
   if (line1) { M5.Display.setCursor(8, 40); M5.Display.println(line1); }
   if (line2) { M5.Display.setCursor(8, 56); M5.Display.println(line2); }
-}
-
-void drawMLResult(ei_impulse_result_t& result, const char* bestLabel, float bestScore,
-                  float peakAccel, float peakGyro) {
-  M5.Display.setEpdMode(epd_text);
-  M5.Display.fillScreen(TFT_WHITE);
-
-  bool confident = bestScore >= ML_CONFIDENCE_OK;
-  M5.Display.fillRect(0, 0, 200, 22, confident ? TFT_BLACK : TFT_WHITE);
-  M5.Display.setTextColor(confident ? TFT_WHITE : TFT_BLACK,
-                           confident ? TFT_BLACK : TFT_WHITE);
-  M5.Display.setTextSize(2);
-  M5.Display.setCursor(6, 4);
-  M5.Display.print(confident ? "ML OK" : "ML baixo");
-
-  M5.Display.fillRoundRect(8, 30, 184, 50, 6, TFT_BLACK);
-  M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
-  M5.Display.setTextSize(3);
-  M5.Display.setCursor(20, 44);
-  M5.Display.print(bestLabel);
-  M5.Display.setTextSize(1);
-  M5.Display.setCursor(20, 68);
-  M5.Display.printf("conf: %.0f%%", bestScore * 100.0f);
-
-  M5.Display.setTextColor(TFT_BLACK, TFT_WHITE);
-  M5.Display.setTextSize(1);
-  M5.Display.setCursor(8, 92);
-  M5.Display.println("Scores ML:");
-  for (int i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
-    int y = 106 + i * 16;
-    float score = result.classification[i].value;
-    const char* lbl = result.classification[i].label;
-    int barLen = (int)(score * 130.0f);
-    M5.Display.fillRect(8, y + 8, barLen, 6, TFT_BLACK);
-    M5.Display.drawRect(8, y + 8, 130, 6, TFT_BLACK);
-    M5.Display.setCursor(144, y + 4);
-    M5.Display.printf("%s %.2f", lbl, score);
-  }
-
-  int diagY = 108 + EI_CLASSIFIER_LABEL_COUNT * 16 + 8;
-  M5.Display.drawLine(0, diagY, 200, diagY, TFT_BLACK);
-  M5.Display.setCursor(8, diagY + 6);
-  M5.Display.printf("pico accel: %.2f m/s2", peakAccel);
-  M5.Display.setCursor(8, diagY + 20);
-  M5.Display.printf("pico gyro:  %.1f dps", peakGyro);
-  M5.Display.setCursor(8, diagY + 36);
-  M5.Display.println("A voltar...");
 }
 
 // =====================================================================
@@ -813,24 +733,131 @@ void processContext() {
   }
 }
 
+// =====================================================================
+// ML-powered processGesture() — Gemini-style capture + inference + retry
+// =====================================================================
 void processGesture(const ImuReading& reading, float accelDelta, float accelZDelta) {
-  if (millis() - stateStartedAt > GESTURE_WINDOW_MS) { goIdle("Sem gesto"); return; }
-  GestureId gestureId = detectGesture(reading, accelDelta, accelZDelta);
-  if (gestureId == GESTURE_NONE) return;
-  lastGestureAt = millis();
-  GestureInfo info = gestureInfo(gestureId);
-  Serial.printf("[gesture] Gesto enviado: %s\n", info.payload);
-  drawBoot("Enviar", info.title, activeRoom);
-  int httpCode = -1;
-  bool sent = postFullGesture(info, httpCode);
-  drawGestureResult(info, sent, httpCode);
-  appState = STATE_RESULT; returnToIdleAt = millis() + RESULT_RETURN_MS;
+  int tentativas = 0;
+  const int MAX_TENTATIVAS = 5;
+
+  while (tentativas < MAX_TENTATIVAS) {
+    tentativas++;
+
+    // 1. SINCRONIZAÇÃO: ecrã dita o momento exato de começar
+    drawBoot("PREPARA...", "Nao te mexas.", "Gesto no proximo ecra!");
+    delay(1000);
+
+    // 2. SINAL DE ARRANQUE E RECOLHA (1s a 100Hz)
+    drawBoot("JA!", "FAZ O GESTO AGORA", "A gravar 1 segundo...");
+    Serial.println("[ml] JA! A recolher 1s...");
+
+    const int numSamples = EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE / 6;
+    static float buffer[EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE];
+
+    for (int i = 0; i < numSamples; i++) {
+      unsigned long t0 = millis();
+
+      accel->readSensor();
+      gyro->readSensor();
+
+      int base = i * 6;
+      buffer[base + 0] = accel->getAccelX_mss();
+      buffer[base + 1] = accel->getAccelY_mss();
+      buffer[base + 2] = accel->getAccelZ_mss();
+      buffer[base + 3] = gyro->getGyroX_rads() * RAD_TO_DEG_PER_SEC;
+      buffer[base + 4] = gyro->getGyroY_rads() * RAD_TO_DEG_PER_SEC;
+      buffer[base + 5] = gyro->getGyroZ_rads() * RAD_TO_DEG_PER_SEC;
+
+      long remaining = 10L - (long)(millis() - t0);
+      if (remaining > 0) delay(remaining);
+    }
+
+    drawBoot("A processar...", "A classificar com IA", "Aguarda...");
+
+    // 3. INFERÊNCIA ML
+    signal_t signal;
+    int sigErr = numpy::signal_from_buffer(buffer, EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE, &signal);
+    if (sigErr != 0) {
+      Serial.printf("[ml] ERRO signal_from_buffer: %d\n", sigErr);
+      goIdle("Erro buffer ML");
+      return;
+    }
+
+    ei_impulse_result_t result = {0};
+    EI_IMPULSE_ERROR status = run_classifier(&signal, &result, false);
+    if (status != EI_IMPULSE_OK) {
+      Serial.printf("[ml] ERRO run_classifier: %d\n", (int)status);
+      goIdle("Erro classificador");
+      return;
+    }
+
+    // 4. AVALIAÇÃO DO RESULTADO
+    float bestScore = 0.0f;
+    int bestIdx = 0;
+    Serial.println("[ml] Resultados:");
+    for (int i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+      float s = result.classification[i].value;
+      const char* l = result.classification[i].label;
+      Serial.printf("     %-12s %.4f\n", l, s);
+      if (s > bestScore) { bestScore = s; bestIdx = i; }
+    }
+
+    const char* bestLabel = result.classification[bestIdx].label;
+    Serial.printf("[ml] Melhor: %s (%.0f%%)\n", bestLabel, bestScore * 100.0f);
+
+    // 5. RETRY SE FOR "PARADO" OU BAIXA CONFIANÇA
+    if (strcmp(bestLabel, "parado") == 0 || bestScore < ML_CONFIDENCE_OK) {
+      drawBoot("REPETIR", "Gesto: 'parado'", "Prepara o pulso...");
+      Serial.println("[ml] Detetado como parado ou incerto. A repetir...");
+      delay(2500);
+      continue;
+    }
+
+    // 6. MAPEAR LABEL PARA GESTURE ID
+    GestureId gestureId = GESTURE_NONE;
+    if (strcmp(bestLabel, "Cima") == 0) gestureId = GESTURE_UP;
+    else if (strcmp(bestLabel, "Baixo") == 0) gestureId = GESTURE_DOWN;
+    else if (strcmp(bestLabel, "RodarFora") == 0) gestureId = GESTURE_ROTATE_OUT;
+    else if (strcmp(bestLabel, "RodarDentro") == 0) gestureId = GESTURE_ROTATE_IN;
+    else {
+      // Label desconhecida — tratar como "parado" e repetir
+      drawBoot("Gesto Invalido", bestLabel, "Vou repetir...");
+      Serial.printf("[ml] Label desconhecida: %s. A repetir...\n", bestLabel);
+      delay(2500);
+      continue;
+    }
+
+    // 7. SUCESSO — enviar para o servidor
+    GestureInfo info = gestureInfo(gestureId);
+    // Override with ML label in case it differs
+    info.payload = bestLabel;
+    info.title = bestLabel;
+    info.action = "Comando IA";
+
+    lastGestureAt = millis();
+    int httpCode = -1;
+    bool sent = postGesture(info, httpCode);
+    drawGestureResult(info, sent, httpCode);
+
+    appState = STATE_RESULT;
+    returnToIdleAt = millis() + RESULT_RETURN_MS;
+    return; // Sucesso!
+  }
+
+  // Esgotaram as tentativas
+  goIdle("Demasiadas falhas");
 }
 
 void recoverImuIfNeeded() {
   if (imuFaultCount < 3) return;
   imuReady = initImu();
   if (imuReady) { calibrateZero(); goIdle("IMU recuperado"); }
+}
+
+void handleButtons() {
+  if (!M5.BtnA.wasPressed()) return;
+  Serial.println("\n[btn] Recalibrar sensores forçado");
+  calibrateZero(); calibrateMic(); goIdle("Sensores calibrados");
 }
 
 void maybeReturnToIdle() {
@@ -846,153 +873,6 @@ void printImuStatus(const ImuReading& r, float accelDelta, float gyroAbs) {
 }
 
 // =====================================================================
-// ML Test — from teste_ml_gesto_unico.ino, adapted to run on demand
-// =====================================================================
-
-void runMLDiagnostic() {
-  appState = STATE_ML_TEST;
-
-  drawMsg("Teste ML", "Prepara...", "Vai comecar!");
-  Serial.println("\n===== ML Diagnostic Test =====");
-  Serial.printf("  Labels: %d\n", EI_CLASSIFIER_LABEL_COUNT);
-  for (int i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
-    Serial.printf("  [%d] %s\n", i, ei_classifier_inferencing_categories[i]);
-  }
-
-  // Wait and prompt user
-  drawMsg("PREPARA", "Aguarda... NAO faças", "o gesto ainda.");
-  delay(PRE_CAPTURE_MS);
-
-  drawMsg("JA!", "Faz o gesto", "UMA VEZ, agora!");
-  Serial.println("[ml] JA! -> recolha a comecar.");
-
-  // Capture 1s at 100Hz (same as original ML test)
-  const int numSamples = EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE / 6;
-  static float buffer[EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE];
-
-  float peakAccel = 0.0f, peakGyro = 0.0f;
-
-  for (int i = 0; i < numSamples; i++) {
-    unsigned long t0 = millis();
-
-    accel->readSensor();
-    gyro->readSensor();
-
-    int base = i * 6;
-    float ax = accel->getAccelX_mss();
-    float ay = accel->getAccelY_mss();
-    float az = accel->getAccelZ_mss();
-    float gx = gyro->getGyroX_rads() * RAD_TO_DEG_PER_SEC;
-    float gy = gyro->getGyroY_rads() * RAD_TO_DEG_PER_SEC;
-    float gz = gyro->getGyroZ_rads() * RAD_TO_DEG_PER_SEC;
-
-    buffer[base + 0] = ax;
-    buffer[base + 1] = ay;
-    buffer[base + 2] = az;
-    buffer[base + 3] = gx;
-    buffer[base + 4] = gy;
-    buffer[base + 5] = gz;
-
-    float mag = sqrtf(ax*ax + ay*ay + az*az);
-    if (mag > peakAccel) peakAccel = mag;
-    float gmag = sqrtf(gx*gx + gy*gy + gz*gz);
-    if (gmag > peakGyro) peakGyro = gmag;
-
-    long remaining = 10L - (long)(millis() - t0);
-    if (remaining > 0) delay(remaining);
-  }
-
-  Serial.println("[ok] Recolha concluida (1s).");
-  Serial.printf("  Pico accel: %.3f m/s2  |  Pico gyro: %.1f dps\n", peakAccel, peakGyro);
-
-  // Run inference
-  drawMsg("A pensar...", "A classificar o gesto", nullptr);
-  Serial.println("[ml] A correr classificador...");
-
-  signal_t signal;
-  int sigErr = numpy::signal_from_buffer(buffer, EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE, &signal);
-  if (sigErr != 0) {
-    drawMsg("ERRO", "signal_from_buffer falhou", nullptr);
-    Serial.printf("[ml] ERRO signal_from_buffer: %d\n", sigErr);
-    delay(3000);
-    goIdle("ML erro");
-    return;
-  }
-
-  ei_impulse_result_t result = {0};
-  EI_IMPULSE_ERROR status = run_classifier(&signal, &result, false);
-  if (status != EI_IMPULSE_OK) {
-    drawMsg("ERRO", "run_classifier falhou", nullptr);
-    Serial.printf("[ml] ERRO run_classifier: %d\n", (int)status);
-    delay(3000);
-    goIdle("ML erro");
-    return;
-  }
-
-  // Parse results
-  float bestScore = 0.0f;
-  int   bestIdx   = 0;
-  Serial.println("[ml] Resultados:");
-  for (int i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
-    float s = result.classification[i].value;
-    const char* l = result.classification[i].label;
-    Serial.printf("     %-10s %.4f  %s\n", l, s,
-                  s >= ML_CONFIDENCE_OK ? "<-- ACIMA LIMIAR" : "");
-    if (s > bestScore) { bestScore = s; bestIdx = i; }
-  }
-
-  if (peakAccel < 5.0f) {
-    Serial.println("[AVISO] Pico de accel muito baixo (<5 m/s2).");
-  }
-  if (bestScore < ML_CONFIDENCE_OK) {
-    Serial.printf("[AVISO] Confianca baixa (%.2f).\n", bestScore);
-  }
-
-  const char* bestLabel = result.classification[bestIdx].label;
-  Serial.printf("\n>>> RESULTADO ML: %s (%.0f%%) <<<\n\n", bestLabel, bestScore * 100.0f);
-
-  drawMLResult(result, bestLabel, bestScore, peakAccel, peakGyro);
-
-  // Show result for 5 seconds, then return to idle
-  delay(5000);
-  goIdle("ML completo");
-}
-
-// =====================================================================
-// Button Handling
-// =====================================================================
-
-void handleButton() {
-  M5.update();
-
-  if (M5.BtnA.wasHold()) {
-    // Button was held for >= 500ms (default hold threshold)
-    if (!btnHeld && appState == STATE_IDLE) {
-      btnHeld = true;
-      Serial.println("[btn] Hold detectado! A iniciar teste ML...");
-      runMLDiagnostic();
-    }
-    return;
-  }
-
-  if (M5.BtnA.wasPressed()) {
-    // Short press — recalibrate (only in IDLE or RESULT)
-    if (appState == STATE_IDLE || appState == STATE_RESULT) {
-      Serial.println("\n[btn] Recalibrar sensores");
-      calibrateZero();
-      calibrateMic();
-      goIdle("Sensores calibrados");
-    }
-    return;
-  }
-
-  // Reset hold state when button is released
-  if (btnHeld && !M5.BtnA.isPressed()) {
-    btnHeld = false;
-  }
-}
-
-// =====================================================================
 // setup()
 // =====================================================================
 
@@ -1005,9 +885,6 @@ void setup() {
   pinMode(MIC_ANALOG_PIN, INPUT);
   analogReadResolution(12);
   analogSetPinAttenuation(MIC_ANALOG_PIN, ADC_11db);
-
-  // Configure button hold time (long press detection)
-  M5.BtnA.setHoldThresh(2000);  // 2 seconds for hold
 
   drawBoot("OmniBand", "A iniciar IMU...", "");
   imuReady = initImu();
@@ -1029,15 +906,7 @@ void setup() {
 // =====================================================================
 
 void loop() {
-  handleButton();
-
-  // If in ML test mode, do nothing (ML runs in its own blocking flow)
-  if (appState == STATE_ML_TEST) {
-    delay(100);
-    return;
-  }
-
-  maybeReturnToIdle();
+  M5.update(); handleButtons(); maybeReturnToIdle();
 
   ImuReading reading;
   if (!readImu(reading)) { recoverImuIfNeeded(); delay(50); return; }
@@ -1048,13 +917,9 @@ void loop() {
 
   printImuStatus(reading, accelDelta, gyroAbs);
 
-  // ===================================================================
-  // SIMPLE MODE INTEGRATION:
-  // In IDLE state, also check for simple threshold gestures.
-  // If detected, send quick command without context.
-  // This integrates codigo_funciona_cima.txt into the same loop.
-  // ===================================================================
+  // In IDLE state: check for quick simple gestures AND wake gesture
   if (appState == STATE_IDLE) {
+    // Simple threshold fallback (from codigo_funciona_cima.txt)
     if (millis() - simpleLastSend > SIMPLE_COOLDOWN_MS) {
       if (detectSimpleUp(reading)) {
         Serial.println("Gesto Cima (simples) detetado");
@@ -1069,15 +934,13 @@ void loop() {
       }
     }
 
-    // Also check for wake gesture (full mode)
+    // Wake gesture for full ML mode
     if (detectWake(reading, accelDelta, gyroAbs)) {
       startContext();
     }
   }
 
-  // ===================================================================
-  // FULL STATE MACHINE
-  // ===================================================================
+  // Full state machine
   switch (appState) {
     case STATE_CONTEXT:
       processContext();
