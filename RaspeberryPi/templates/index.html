@@ -1,0 +1,610 @@
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OmniBand Dashboard</title>
+    <style>
+        :root {
+            --bg: #f4f5f7;
+            --surface: #ffffff;
+            --surface-soft: #eef1f5;
+            --border: #d8dde6;
+            --text: #1f2937;
+            --muted: #6b7280;
+            --primary: #2563eb;
+            --success: #16a34a;
+            --danger: #dc2626;
+            --shadow: 0 10px 30px rgba(15, 23, 42, 0.08);
+            --radius: 16px;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            font-family: Arial, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+        }
+
+        .layout {
+            display: grid;
+            grid-template-columns: 260px 1fr;
+            min-height: 100vh;
+        }
+
+        .sidebar {
+            background: #0f172a;
+            color: white;
+            padding: 28px 20px;
+            position: sticky;
+            top: 0;
+            height: 100vh;
+        }
+
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            font-size: 20px;
+            font-weight: 700;
+            margin-bottom: 28px;
+        }
+
+        .brand-mark {
+            width: 38px;
+            height: 38px;
+            border-radius: 12px;
+            background: linear-gradient(135deg, #7c3aed, #2563eb);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 18px;
+        }
+
+        .nav-group {
+            margin-top: 24px;
+        }
+
+        .nav-title {
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: #94a3b8;
+            margin-bottom: 10px;
+        }
+
+        .nav-link {
+            display: block;
+            color: white;
+            text-decoration: none;
+            padding: 10px 12px;
+            border-radius: 10px;
+            margin-bottom: 6px;
+            background: rgba(255,255,255,0.04);
+        }
+
+        .nav-link:hover {
+            background: rgba(255,255,255,0.08);
+        }
+
+        .content {
+            padding: 28px;
+        }
+
+        .topbar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 20px;
+            margin-bottom: 24px;
+        }
+
+        .page-title {
+            margin: 0;
+            font-size: 28px;
+        }
+
+        .page-subtitle {
+            margin: 6px 0 0;
+            color: var(--muted);
+        }
+
+        .pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 10px 14px;
+            border-radius: 999px;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            box-shadow: var(--shadow);
+            font-size: 14px;
+        }
+
+        .grid {
+            display: grid;
+            gap: 20px;
+        }
+
+        .grid-2 {
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+
+        .grid-3 {
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+        }
+
+        .card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            box-shadow: var(--shadow);
+            padding: 20px;
+        }
+
+        .card h3 {
+            margin-top: 0;
+            margin-bottom: 16px;
+            font-size: 18px;
+        }
+
+        .form-row {
+            display: grid;
+            gap: 10px;
+            margin-top: 12px;
+        }
+
+        input, select, button {
+            font: inherit;
+        }
+
+        input, select {
+            width: 100%;
+            padding: 11px 12px;
+            border-radius: 10px;
+            border: 1px solid var(--border);
+            background: white;
+        }
+
+        button {
+            border: 0;
+            border-radius: 10px;
+            padding: 10px 14px;
+            cursor: pointer;
+        }
+
+        .btn-primary {
+            background: var(--primary);
+            color: white;
+        }
+
+        .btn-muted {
+            background: #e5e7eb;
+            color: #111827;
+        }
+
+        .btn-danger {
+            background: var(--danger);
+            color: white;
+        }
+
+        .btn-success {
+            background: var(--success);
+            color: white;
+        }
+
+        .inline-form {
+            display: inline;
+        }
+
+        .message {
+            display: none;
+            margin-bottom: 20px;
+            padding: 14px 16px;
+            border-radius: 12px;
+            border: 1px solid transparent;
+        }
+
+        .list {
+            display: grid;
+            gap: 12px;
+        }
+
+        .list-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 16px;
+            padding: 14px;
+            background: var(--surface-soft);
+            border-radius: 12px;
+            border: 1px solid var(--border);
+        }
+
+        .list-item strong {
+            display: block;
+            margin-bottom: 4px;
+        }
+
+        .device-card {
+            display: grid;
+            gap: 12px;
+        }
+
+        .status {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            font-weight: 700;
+        }
+
+        .dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            display: inline-block;
+        }
+
+        .status-on .dot {
+            background: var(--success);
+        }
+
+        .status-off .dot {
+            background: var(--danger);
+        }
+
+        .muted {
+            color: var(--muted);
+        }
+
+        .logs {
+            display: grid;
+            gap: 12px;
+        }
+
+        .log-item {
+            padding: 14px;
+            border-radius: 12px;
+            background: var(--surface-soft);
+            border: 1px solid var(--border);
+        }
+
+        .log-meta {
+            font-size: 13px;
+            color: var(--muted);
+            margin-bottom: 8px;
+        }
+
+        .log-title {
+            font-weight: 700;
+            margin-bottom: 6px;
+        }
+
+        .section-title {
+            margin: 0 0 16px;
+            font-size: 18px;
+        }
+
+        .two-col {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+
+        .full {
+            grid-column: 1 / -1;
+        }
+
+        @media (max-width: 1100px) {
+            .layout {
+                grid-template-columns: 1fr;
+            }
+
+            .sidebar {
+                position: relative;
+                height: auto;
+            }
+
+            .grid-2,
+            .grid-3,
+            .two-col {
+                grid-template-columns: 1fr;
+            }
+
+            .content {
+                padding: 20px;
+            }
+
+            .topbar {
+                flex-direction: column;
+                align-items: flex-start;
+            }
+        }
+    </style>
+</head>
+<body>
+
+<div class="layout">
+    <aside class="sidebar">
+        <div class="brand">
+            <div class="brand-mark">🪄</div>
+            <div>OmniBand</div>
+        </div>
+
+        <div class="nav-group">
+            <div class="nav-title">Dashboard</div>
+            <a class="nav-link" href="#overview">Visão geral</a>
+            <a class="nav-link" href="#devices">Dispositivos</a>
+            <a class="nav-link" href="#logs">Histórico</a>
+            <a class="nav-link" href="#rules">Regras</a>
+        </div>
+
+        <div class="nav-group">
+            <div class="nav-title">Estado</div>
+            <div class="pill">Atualização automática ativa</div>
+        </div>
+    </aside>
+
+    <main class="content">
+        <section class="topbar" id="overview">
+            <div>
+                <h1 class="page-title">OmniBand Dashboard</h1>
+                <p class="page-subtitle">Gestão de gestos, dispositivos, regras e histórico em tempo real.</p>
+            </div>
+            <div class="pill">Raspberry Pi ready</div>
+        </section>
+
+        <div id="message-box" class="message"></div>
+
+        <section class="grid grid-2" style="margin-bottom:20px;">
+            <div class="card">
+                <h3>Adicionar Gesto</h3>
+                <form action="/add_gesture" method="POST" class="form-row">
+                    <input type="text" name="gesture_name" placeholder="Nome do gesto" required>
+                    <button class="btn-primary" type="submit">Adicionar gesto</button>
+                </form>
+            </div>
+
+            <div class="card">
+                <h3>Adicionar Dispositivo</h3>
+                <form action="/add_device" method="POST" class="form-row">
+                    <input type="text" name="device_name" placeholder="Nome do dispositivo" required>
+                    <input type="text" name="entity_id" placeholder="Entity ID (ex: switch.tapo_p110_sala)" required>
+                    <button class="btn-primary" type="submit">Adicionar dispositivo</button>
+                </form>
+            </div>
+        </section>
+
+        <section class="card" id="rules" style="margin-bottom:20px;">
+            <h3>Nova Regra</h3>
+            <form action="/add_rule" method="POST" class="form-row">
+                <div class="two-col">
+                    <select name="gesture_id" required>
+                        {% for g in gestures %}
+                            <option value="{{ g.id }}">{{ g.name }}</option>
+                        {% endfor %}
+                    </select>
+
+                    <select name="device_id" required>
+                        {% for d in devices %}
+                            <option value="{{ d.id }}">{{ d.name }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+
+                <select name="action" required>
+                    <option value="on">Ligar</option>
+                    <option value="off">Desligar</option>
+                    <option value="toggle">Alternar</option>
+                </select>
+
+                <button class="btn-primary" type="submit">Salvar regra</button>
+            </form>
+        </section>
+
+        <section class="grid grid-2" style="margin-bottom:20px;">
+            <div class="card">
+                <h3>Gestos</h3>
+                {% if gestures %}
+                    <div class="list">
+                        {% for g in gestures %}
+                            <div class="list-item">
+                                <div>
+                                    <strong>{{ g.name }}</strong>
+                                    <div class="muted">Gesto disponível para configuração</div>
+                                </div>
+                                <form action="/delete_gesture/{{ g.id }}" method="POST" class="inline-form">
+                                    <button class="btn-danger" type="submit">Apagar</button>
+                                </form>
+                            </div>
+                        {% endfor %}
+                    </div>
+                {% else %}
+                    <p class="muted">Não existem gestos registados.</p>
+                {% endif %}
+            </div>
+
+            <div class="card" id="devices">
+                <h3>Dispositivos</h3>
+                {% if devices %}
+                    <div class="list">
+                        {% for d in devices %}
+                            <div class="list-item">
+                                <div>
+                                    <strong>{{ d.name }}</strong>
+                                    <div class="muted">{{ d.entity_id }}</div>
+                                </div>
+                                <form action="/delete_device/{{ d.id }}" method="POST" class="inline-form">
+                                    <button class="btn-danger" type="submit">Apagar</button>
+                                </form>
+                            </div>
+                        {% endfor %}
+                    </div>
+                {% else %}
+                    <p class="muted">Não existem dispositivos registados.</p>
+                {% endif %}
+            </div>
+        </section>
+
+        <section class="card" style="margin-bottom:20px;">
+            <h3>As Tuas Regras</h3>
+            {% if rules %}
+                <div class="list">
+                    {% for r in rules %}
+                        <div class="list-item">
+                            <div>
+                                <strong>{{ r.g_name }} → {{ r.action }}</strong>
+                                <div class="muted">Dispositivo: {{ r.d_name }}</div>
+                            </div>
+                            <form action="/delete_rule/{{ r.id }}" method="POST" class="inline-form">
+                                <button class="btn-danger" type="submit">Apagar</button>
+                            </form>
+                        </div>
+                    {% endfor %}
+                </div>
+            {% else %}
+                <p class="muted">Ainda não existem regras configuradas.</p>
+            {% endif %}
+        </section>
+
+        <section class="card" style="margin-bottom:20px;">
+            <h3 class="section-title">Estado dos Dispositivos</h3>
+            <div id="devices-container"></div>
+        </section>
+
+        <section class="card" id="logs">
+            <h3 class="section-title">Histórico de Eventos</h3>
+            <div id="logs-container"></div>
+        </section>
+    </main>
+</div>
+
+<script>
+    function showMessage(text, type) {
+        const box = document.getElementById('message-box');
+        box.style.display = 'block';
+        box.innerText = text;
+
+        if (type === 'success') {
+            box.style.backgroundColor = '#d4edda';
+            box.style.color = '#155724';
+            box.style.borderColor = '#c3e6cb';
+        } else {
+            box.style.backgroundColor = '#f8d7da';
+            box.style.color = '#721c24';
+            box.style.borderColor = '#f5c6cb';
+        }
+
+        setTimeout(() => {
+            box.style.display = 'none';
+        }, 3000);
+    }
+
+    async function atualizarDispositivos() {
+        try {
+            const response = await fetch('/api/devices');
+            const devices = await response.json();
+
+            const container = document.getElementById('devices-container');
+            container.innerHTML = '';
+
+            if (devices.length === 0) {
+                container.innerHTML = '<p class="muted">Não existem dispositivos registados.</p>';
+                return;
+            }
+
+            devices.forEach(device => {
+                const statusClass = device.current_state === 'on' ? 'status-on' : 'status-off';
+
+                const card = document.createElement('div');
+                card.className = `card device-card ${statusClass}`;
+                card.style.marginBottom = '16px';
+
+                    card.innerHTML = `
+                        <div class="status ${statusClass}">
+                            <span class="dot"></span>
+                            <span>${device.current_state}</span>
+                        </div>
+                        <div>
+                            <strong>${device.name}</strong>
+                            <div class="muted">Entity ID: ${device.entity_id}</div>
+                        </div>
+                        <div style="display:flex; gap:10px; flex-wrap:wrap;">
+                            <button class="btn-success" onclick="controlDevice(${device.id}, 'on')">Ligar</button>
+                            <button class="btn-danger" onclick="controlDevice(${device.id}, 'off')">Desligar</button>
+                            <button class="btn-muted" onclick="controlDevice(${device.id}, 'toggle')">Toggle</button>
+                        </div>
+                    `;
+                container.appendChild(card);
+            });
+        } catch (error) {
+            console.error('Erro ao atualizar dispositivos:', error);
+        }
+    }
+
+    async function atualizarLogs() {
+        try {
+            const response = await fetch('/api/logs');
+            const logs = await response.json();
+
+            const container = document.getElementById('logs-container');
+            container.innerHTML = '';
+
+            if (logs.length === 0) {
+                container.innerHTML = '<p class="muted">Ainda não existem eventos registados.</p>';
+                return;
+            }
+
+            logs.forEach(log => {
+                const item = document.createElement('div');
+                item.className = 'log-item';
+                item.innerHTML = `
+                    <div class="log-meta">${log.created_at} · ${log.source}</div>
+                    <div class="log-title">${log.device_name}</div>
+                    <div>Gesto: ${log.gesture_name || '-'}</div>
+                    <div>Ação: ${log.action}</div>
+                    <div>Estado: ${log.previous_state || '-'} → <b>${log.new_state}</b></div>
+                `;
+                container.appendChild(item);
+            });
+        } catch (error) {
+            console.error('Erro ao atualizar logs:', error);
+        }
+    }
+
+    async function controlDevice(deviceId, action) {
+        try {
+            const response = await fetch(`/api/device/${deviceId}/action`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ action: action })
+            });
+
+            const result = await response.json();
+
+            if (result.sucesso) {
+                showMessage(`Dispositivo "${result.device_name}" alterado para ${result.novo_estado}.`, 'success');
+                atualizarDispositivos();
+                atualizarLogs();
+            } else {
+                showMessage(result.erro || 'Erro ao controlar dispositivo.', 'error');
+            }
+        } catch (error) {
+            showMessage('Erro de comunicação com o servidor.', 'error');
+        }
+    }
+
+    atualizarDispositivos();
+    atualizarLogs();
+    setInterval(atualizarDispositivos, 2000);
+    setInterval(atualizarLogs, 2000);
+</script>
+
+</body>
+</html>
