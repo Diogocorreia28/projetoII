@@ -1,12 +1,14 @@
 // =====================================================================
 // OmniBand_Unified.ino — FINAL VERSION
 // =====================================================================
-// Fully integrated firmware combining:
-//   1. Wake gesture → clap context → ML gesture classification
-//   2. 1-second IMU capture + Edge Impulse inference
-//   3. Retry logic if gesture is "parado" or low confidence
-//   4. Simple threshold gestures as quick fallback in IDLE
-//   5. Full e-paper UI with icons, clap progress, ML results
+// Fully integrated firmware:
+//   1. Wake by wrist movement → clap context (1/2/3 palmas)
+//   2. ML gesture classification (Edge Impulse): "cima" / "baixo" / "parado"
+//   3. Simple threshold fallback in IDLE (codigo_funciona_cima.txt)
+//   4. Full e-paper UI on CoreInk 200x200
+//
+// Model labels (Edge Impulse): cima, baixo, parado (minúsculas)
+// Server expects: Cima, Baixo (maiúsculas) — converted on send
 // =====================================================================
 
 #include <M5Unified.h>
@@ -18,7 +20,7 @@
 #include <correia_2k-project-1_inferencing.h>
 
 // =====================================================================
-// WiFi & Server Configuration — CHANGE THESE TO MATCH YOUR NETWORK
+// WiFi & Server Configuration
 // =====================================================================
 const char* WIFI_SSID = "CasaLt33";
 const char* WIFI_PASS = "luisdiogo";
@@ -87,17 +89,10 @@ const float WAKE_GYRO_THRESHOLD_DPS = 150.0f;
 const unsigned long WAKE_COOLDOWN_MS = 1200;
 const int WAKE_CONFIRM_SAMPLES = 2;
 
-// Rotation detection (used only for fallback simple mode)
+// General
 const float RAD_TO_DEG_PER_SEC = 57.2957795f;
-
-// ML capture constants
-const unsigned long PRE_CAPTURE_MS = 1000;
-const float ML_CONFIDENCE_OK = 0.65f;
-
-// State machine
 const unsigned long GESTURE_WINDOW_MS = 9000;
-const unsigned long GESTURE_COOLDOWN_MS = 1500;
-const unsigned long RESULT_RETURN_MS = 5000; // Show result for 5s
+const unsigned long RESULT_RETURN_MS = 5000;
 
 // =====================================================================
 // State Variables
@@ -109,14 +104,12 @@ float adaptiveNoiseFloor = 350.0f;
 unsigned long lastPlotterAt = 0;
 
 unsigned long lastWakeAt = 0;
-unsigned long lastGestureAt = 0;
 unsigned long lastImuSerialAt = 0;
 unsigned long lastMicSampleAt = 0;
 unsigned long stateStartedAt = 0;
 unsigned long firstClapAt = 0;
 unsigned long lastClapAt = 0;
 unsigned long returnToIdleAt = 0;
-bool btnHeld = false;
 
 int clapCount = 0;
 int activeClaps = 0;
@@ -132,21 +125,6 @@ enum AppState {
   STATE_CONTEXT,
   STATE_GESTURE,
   STATE_RESULT
-};
-
-enum GestureId {
-  GESTURE_NONE,
-  GESTURE_UP,
-  GESTURE_DOWN,
-  GESTURE_ROTATE_OUT,
-  GESTURE_ROTATE_IN
-};
-
-struct GestureInfo {
-  GestureId id;
-  const char* payload;
-  const char* title;
-  const char* action;
 };
 
 struct ImuReading {
@@ -168,6 +146,12 @@ struct MicStats {
   bool suspicious;
 };
 
+struct GestureResult {
+  const char* payload;   // uppercase for server: "Cima" or "Baixo"
+  const char* title;
+  float confidence;
+};
+
 AppState appState = STATE_IDLE;
 ImuReading previousReading;
 bool hasPreviousReading = false;
@@ -176,20 +160,26 @@ bool hasPreviousReading = false;
 // Helper Functions
 // =====================================================================
 
-GestureInfo gestureInfo(GestureId id) {
-  switch (id) {
-    case GESTURE_UP: return {GESTURE_UP, "Cima", "Cima", "Aumentar/subir"};
-    case GESTURE_DOWN: return {GESTURE_DOWN, "Baixo", "Baixo", "Diminuir/descer"};
-    case GESTURE_ROTATE_OUT: return {GESTURE_ROTATE_OUT, "RodarFora", "Rodar fora", "Ligar/acender"};
-    case GESTURE_ROTATE_IN: return {GESTURE_ROTATE_IN, "RodarDentro", "Rodar dentro", "Desligar/apagar"};
-    default: return {GESTURE_NONE, "", "Sem gesto", "A espera"};
-  }
-}
-
 const char* roomFromClaps(int pulses) {
   if (pulses <= 1) return "corredor";
   if (pulses == 2) return "sala";
   return "quarto";
+}
+
+// Map model label (lowercase) to server payload (uppercase)
+GestureResult mapModelToGesture(const char* modelLabel, float confidence) {
+  GestureResult r = { "", "", confidence };
+  if (strcmp(modelLabel, "cima") == 0) {
+    r.payload = "Cima";
+    r.title = "Cima";
+  } else if (strcmp(modelLabel, "baixo") == 0) {
+    r.payload = "Baixo";
+    r.title = "Baixo";
+  } else {
+    r.payload = "";
+    r.title = "Parado";
+  }
+  return r;
 }
 
 // =====================================================================
@@ -311,16 +301,12 @@ float accelDeltaFromPrevious(const ImuReading& r) {
   return sqrtf(dx * dx + dy * dy + dz * dz);
 }
 
-float accelZDeltaFromPrevious(const ImuReading& r) {
-  return hasPreviousReading ? r.az - previousReading.az : 0.0f;
-}
-
 void rememberImuReading(const ImuReading& r) {
   previousReading = r; hasPreviousReading = true;
 }
 
 // =====================================================================
-// Gesture Detection — Wake only (no more threshold gestures in main path)
+// Gesture Detection — Wake + Simple fallback
 // =====================================================================
 
 bool detectWake(const ImuReading& r, float accelDelta, float gyroAbs) {
@@ -329,7 +315,6 @@ bool detectWake(const ImuReading& r, float accelDelta, float gyroAbs) {
   return wakeHitCount >= WAKE_CONFIRM_SAMPLES;
 }
 
-// Simple threshold detection (fallback quick gestures in IDLE, from codigo_funciona_cima.txt)
 bool detectSimpleUp(const ImuReading& r) {
   return (r.az > SIMPLE_CIMA_THRESHOLD_AZ && r.mag > SIMPLE_CIMA_THRESHOLD_MAG);
 }
@@ -351,24 +336,24 @@ bool postSimpleGesture(const char* gesture) {
   http.addHeader("Content-Type", "application/json");
   String payload = String("{\"gesto\":\"") + gesture + "\"}";
   int code = http.POST(payload);
-  Serial.print("Payload enviado: ");
+  Serial.print("Payload: ");
   Serial.println(payload);
-  Serial.print("HTTP code: ");
+  Serial.print("HTTP: ");
   Serial.println(code);
   http.end();
   return code > 0 && code < 400;
 }
 
-bool postGesture(const GestureInfo& info, int& httpCode) {
+bool postMLGesture(const char* gesturePayload, const char* gestureTitle, int& httpCode) {
   httpCode = -1;
   if (!connectWiFi(5000)) return false;
   HTTPClient http;
   http.begin(SERVER_URL);
   http.addHeader("Content-Type", "application/json");
-  String payload = String("{\"gesto\":\"") + info.payload
+  String payload = String("{\"gesto\":\"") + gesturePayload
     + "\",\"contexto\":\"" + activeRoom
     + "\",\"palmas\":" + activeClaps
-    + ",\"acao\":\"" + info.action + "\"}";
+    + ",\"acao\":\"Comando IA\"}";
   httpCode = http.POST(payload);
   Serial.println("[http] POST: " + payload);
   http.end();
@@ -407,7 +392,7 @@ void drawFooterHint(const char* text) {
   M5.Display.print(text);
 }
 
-// --- Icons ---
+// --- Icons (only up & down — no rotation) ---
 void iconArrowUp(int x, int y, bool inverted) {
   uint16_t fg = inverted ? TFT_WHITE : TFT_BLACK;
   M5.Display.fillTriangle(x + 9, y + 2, x + 3, y + 11, x + 15, y + 11, fg);
@@ -420,30 +405,7 @@ void iconArrowDown(int x, int y, bool inverted) {
   M5.Display.fillRect(x + 7, y + 2, 4, 5, fg);
 }
 
-void iconRotateOut(int x, int y, bool inverted) {
-  uint16_t fg = inverted ? TFT_WHITE : TFT_BLACK;
-  M5.Display.drawArc(x + 9, y + 9, 5, 7, 40, 320, fg);
-  M5.Display.fillTriangle(x + 16, y + 3, x + 16, y + 9, x + 10, y + 5, fg);
-}
-
-void iconRotateIn(int x, int y, bool inverted) {
-  uint16_t fg = inverted ? TFT_WHITE : TFT_BLACK;
-  M5.Display.drawArc(x + 9, y + 9, 5, 7, 220, 500, fg);
-  M5.Display.fillTriangle(x + 2, y + 3, x + 2, y + 9, x + 8, y + 5, fg);
-}
-
-void drawGestureIcon(GestureId id, int x, int y, bool inverted) {
-  M5.Display.drawRoundRect(x, y, 18, 18, 2, inverted ? TFT_WHITE : TFT_BLACK);
-  switch (id) {
-    case GESTURE_UP: iconArrowUp(x, y, inverted); break;
-    case GESTURE_DOWN: iconArrowDown(x, y, inverted); break;
-    case GESTURE_ROTATE_OUT: iconRotateOut(x, y, inverted); break;
-    case GESTURE_ROTATE_IN: iconRotateIn(x, y, inverted); break;
-    default: break;
-  }
-}
-
-void drawGestureRow(int y, GestureId id, const char* name, const char* action, bool highlight) {
+void drawGestureRow(int y, const char* name, const char* action, bool highlight) {
   const int rowH = 26;
   const int x0 = 6;
   const int rowW = SCR_W - 12;
@@ -452,12 +414,11 @@ void drawGestureRow(int y, GestureId id, const char* name, const char* action, b
   } else {
     M5.Display.drawRoundRect(x0, y, rowW, rowH, 3, TFT_BLACK);
   }
-  drawGestureIcon(id, x0 + 5, y + 4, highlight);
   M5.Display.setTextColor(highlight ? TFT_WHITE : TFT_BLACK, highlight ? TFT_BLACK : TFT_WHITE);
   M5.Display.setTextSize(1);
-  M5.Display.setCursor(x0 + 30, y + 4);
+  M5.Display.setCursor(x0 + 10, y + 4);
   M5.Display.print(name);
-  M5.Display.setCursor(x0 + 30, y + 15);
+  M5.Display.setCursor(x0 + 10, y + 15);
   M5.Display.print(action);
 }
 
@@ -605,19 +566,31 @@ void drawGestureWait() {
 
   int y = 28;
   const int rowGap = 5;
-  drawGestureRow(y, GESTURE_UP, "CIMA", "aumentar", false); y += 26 + rowGap;
-  drawGestureRow(y, GESTURE_DOWN, "BAIXO", "diminuir", false); y += 26 + rowGap;
-  drawGestureRow(y, GESTURE_ROTATE_OUT, "ROD. FORA", "ligar", false); y += 26 + rowGap;
-  drawGestureRow(y, GESTURE_ROTATE_IN, "ROD. DENTRO", "desligar", false);
+  drawGestureRow(y, "CIMA", "aumentar", false); y += 26 + rowGap;
+  drawGestureRow(y, "BAIXO", "diminuir", false);
 
   drawListenIndicatorFrame();
   resetListenIndicator();
   drawFooterHint("A espera do gesto...");
 }
 
-void drawGestureResult(const GestureInfo& info, bool sent, int httpCode) {
+void drawMLResult(const GestureResult& result, bool sent, int httpCode) {
   epdFullMode();
   M5.Display.fillScreen(TFT_WHITE);
+
+  if (strlen(result.payload) == 0) {
+    // Parado / no gesture
+    drawTopBar("Parado");
+    M5.Display.setTextColor(TFT_BLACK, TFT_WHITE);
+    M5.Display.setTextSize(1);
+    M5.Display.setCursor(8, 34);
+    M5.Display.print("Nenhum gesto detetado.");
+    M5.Display.setCursor(8, 50);
+    M5.Display.printf("Confianca: %.0f%%", result.confidence * 100.0f);
+    drawFooterHint("A voltar ao inicio...");
+    return;
+  }
+
   drawTopBar(sent ? "Enviado" : "Falhou");
 
   M5.Display.setTextColor(TFT_BLACK, TFT_WHITE);
@@ -627,15 +600,17 @@ void drawGestureResult(const GestureInfo& info, bool sent, int httpCode) {
   M5.Display.println(activeRoom);
 
   M5.Display.drawRoundRect(8, 46, SCR_W - 16, 40, 4, TFT_BLACK);
-  drawGestureIcon(info.id, 16, 57, false);
-  M5.Display.setCursor(42, 56);
+  M5.Display.setTextColor(TFT_BLACK, TFT_WHITE);
+  M5.Display.setTextSize(2);
+  M5.Display.setCursor(24, 56);
+  M5.Display.print(result.title);
   M5.Display.setTextSize(1);
-  M5.Display.print(info.title);
-  M5.Display.setCursor(42, 70);
-  M5.Display.print(info.action);
+  M5.Display.setCursor(24, 72);
+  M5.Display.printf("conf: %.0f%%", result.confidence * 100.0f);
 
+  M5.Display.setTextColor(TFT_BLACK, TFT_WHITE);
   M5.Display.setCursor(8, 96);
-  if (sent) M5.Display.println("Servidor recebeu o comando");
+  if (sent) M5.Display.println("Servidor recebeu");
   else if (WiFi.status() != WL_CONNECTED) M5.Display.println("Falha: WiFi desligado");
   else M5.Display.println("Falha no envio HTTP");
 
@@ -644,21 +619,6 @@ void drawGestureResult(const GestureInfo& info, bool sent, int httpCode) {
   M5.Display.println(httpCode);
 
   drawFooterHint("A voltar ao inicio...");
-}
-
-// ML test screen
-void drawMsg(const char* title, const char* line1, const char* line2) {
-  M5.Display.setEpdMode(epd_fastest);
-  M5.Display.fillScreen(TFT_WHITE);
-  M5.Display.fillRect(0, 0, 200, 22, TFT_BLACK);
-  M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
-  M5.Display.setTextSize(2);
-  M5.Display.setCursor(6, 4);
-  M5.Display.print(title);
-  M5.Display.setTextColor(TFT_BLACK, TFT_WHITE);
-  M5.Display.setTextSize(1);
-  if (line1) { M5.Display.setCursor(8, 40); M5.Display.println(line1); }
-  if (line2) { M5.Display.setCursor(8, 56); M5.Display.println(line2); }
 }
 
 // =====================================================================
@@ -681,7 +641,7 @@ void startContext() {
 void finalizeContext() {
   if (clapCount <= 0) { goIdle("Sem palmas"); return; }
   activeClaps = clapCount; activeRoom = roomFromClaps(clapCount);
-  appState = STATE_GESTURE; stateStartedAt = millis(); lastGestureAt = 0;
+  appState = STATE_GESTURE; stateStartedAt = millis();
   Serial.printf("\n[context] FECHADO: palmas=%d room=%s\n", activeClaps, activeRoom);
   drawGestureWait();
 }
@@ -734,118 +694,103 @@ void processContext() {
 }
 
 // =====================================================================
-// ML-powered processGesture() — Gemini-style capture + inference + retry
+// ML-powered processGesture()
+// Flow: PREPARA (1s) → JA! → capture 1s → infer → classify → send
+// No retry loop — accepts best result and moves on
 // =====================================================================
 void processGesture(const ImuReading& reading, float accelDelta, float accelZDelta) {
-  int tentativas = 0;
-  const int MAX_TENTATIVAS = 5;
+  // 1. SINCRONIZAÇÃO: ecrã dita o momento
+  drawBoot("PREPARA...", "Nao te mexas.", "Gesto no proximo ecra!");
+  delay(1000);
 
-  while (tentativas < MAX_TENTATIVAS) {
-    tentativas++;
+  // 2. SINAL DE ARRANQUE E RECOLHA (1s a 100Hz)
+  drawBoot("JA!", "FAZ O GESTO AGORA", "A gravar 1 segundo...");
+  Serial.println("[ml] JA! A recolher 1s...");
 
-    // 1. SINCRONIZAÇÃO: ecrã dita o momento exato de começar
-    drawBoot("PREPARA...", "Nao te mexas.", "Gesto no proximo ecra!");
-    delay(1000);
+  const int numSamples = EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE / 6;
+  static float buffer[EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE];
+  float peakAccel = 0.0f;
 
-    // 2. SINAL DE ARRANQUE E RECOLHA (1s a 100Hz)
-    drawBoot("JA!", "FAZ O GESTO AGORA", "A gravar 1 segundo...");
-    Serial.println("[ml] JA! A recolher 1s...");
+  for (int i = 0; i < numSamples; i++) {
+    unsigned long t0 = millis();
 
-    const int numSamples = EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE / 6;
-    static float buffer[EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE];
+    accel->readSensor();
+    gyro->readSensor();
 
-    for (int i = 0; i < numSamples; i++) {
-      unsigned long t0 = millis();
+    int base = i * 6;
+    float ax = accel->getAccelX_mss();
+    float ay = accel->getAccelY_mss();
+    float az = accel->getAccelZ_mss();
+    float gx = gyro->getGyroX_rads() * RAD_TO_DEG_PER_SEC;
+    float gy = gyro->getGyroY_rads() * RAD_TO_DEG_PER_SEC;
+    float gz = gyro->getGyroZ_rads() * RAD_TO_DEG_PER_SEC;
 
-      accel->readSensor();
-      gyro->readSensor();
+    buffer[base + 0] = ax;
+    buffer[base + 1] = ay;
+    buffer[base + 2] = az;
+    buffer[base + 3] = gx;
+    buffer[base + 4] = gy;
+    buffer[base + 5] = gz;
 
-      int base = i * 6;
-      buffer[base + 0] = accel->getAccelX_mss();
-      buffer[base + 1] = accel->getAccelY_mss();
-      buffer[base + 2] = accel->getAccelZ_mss();
-      buffer[base + 3] = gyro->getGyroX_rads() * RAD_TO_DEG_PER_SEC;
-      buffer[base + 4] = gyro->getGyroY_rads() * RAD_TO_DEG_PER_SEC;
-      buffer[base + 5] = gyro->getGyroZ_rads() * RAD_TO_DEG_PER_SEC;
+    float mag = sqrtf(ax*ax + ay*ay + az*az);
+    if (mag > peakAccel) peakAccel = mag;
 
-      long remaining = 10L - (long)(millis() - t0);
-      if (remaining > 0) delay(remaining);
-    }
-
-    drawBoot("A processar...", "A classificar com IA", "Aguarda...");
-
-    // 3. INFERÊNCIA ML
-    signal_t signal;
-    int sigErr = numpy::signal_from_buffer(buffer, EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE, &signal);
-    if (sigErr != 0) {
-      Serial.printf("[ml] ERRO signal_from_buffer: %d\n", sigErr);
-      goIdle("Erro buffer ML");
-      return;
-    }
-
-    ei_impulse_result_t result = {0};
-    EI_IMPULSE_ERROR status = run_classifier(&signal, &result, false);
-    if (status != EI_IMPULSE_OK) {
-      Serial.printf("[ml] ERRO run_classifier: %d\n", (int)status);
-      goIdle("Erro classificador");
-      return;
-    }
-
-    // 4. AVALIAÇÃO DO RESULTADO
-    float bestScore = 0.0f;
-    int bestIdx = 0;
-    Serial.println("[ml] Resultados:");
-    for (int i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
-      float s = result.classification[i].value;
-      const char* l = result.classification[i].label;
-      Serial.printf("     %-12s %.4f\n", l, s);
-      if (s > bestScore) { bestScore = s; bestIdx = i; }
-    }
-
-    const char* bestLabel = result.classification[bestIdx].label;
-    Serial.printf("[ml] Melhor: %s (%.0f%%)\n", bestLabel, bestScore * 100.0f);
-
-    // 5. RETRY SE FOR "PARADO" OU BAIXA CONFIANÇA
-    if (strcmp(bestLabel, "parado") == 0 || bestScore < ML_CONFIDENCE_OK) {
-      drawBoot("REPETIR", "Gesto: 'parado'", "Prepara o pulso...");
-      Serial.println("[ml] Detetado como parado ou incerto. A repetir...");
-      delay(2500);
-      continue;
-    }
-
-    // 6. MAPEAR LABEL PARA GESTURE ID
-    GestureId gestureId = GESTURE_NONE;
-    if (strcmp(bestLabel, "Cima") == 0) gestureId = GESTURE_UP;
-    else if (strcmp(bestLabel, "Baixo") == 0) gestureId = GESTURE_DOWN;
-    else if (strcmp(bestLabel, "RodarFora") == 0) gestureId = GESTURE_ROTATE_OUT;
-    else if (strcmp(bestLabel, "RodarDentro") == 0) gestureId = GESTURE_ROTATE_IN;
-    else {
-      // Label desconhecida — tratar como "parado" e repetir
-      drawBoot("Gesto Invalido", bestLabel, "Vou repetir...");
-      Serial.printf("[ml] Label desconhecida: %s. A repetir...\n", bestLabel);
-      delay(2500);
-      continue;
-    }
-
-    // 7. SUCESSO — enviar para o servidor
-    GestureInfo info = gestureInfo(gestureId);
-    // Override with ML label in case it differs
-    info.payload = bestLabel;
-    info.title = bestLabel;
-    info.action = "Comando IA";
-
-    lastGestureAt = millis();
-    int httpCode = -1;
-    bool sent = postGesture(info, httpCode);
-    drawGestureResult(info, sent, httpCode);
-
-    appState = STATE_RESULT;
-    returnToIdleAt = millis() + RESULT_RETURN_MS;
-    return; // Sucesso!
+    long remaining = 10L - (long)(millis() - t0);
+    if (remaining > 0) delay(remaining);
   }
 
-  // Esgotaram as tentativas
-  goIdle("Demasiadas falhas");
+  drawBoot("A processar...", "A classificar com IA", "Aguarda...");
+
+  // 3. INFERÊNCIA ML
+  signal_t signal;
+  int sigErr = numpy::signal_from_buffer(buffer, EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE, &signal);
+  if (sigErr != 0) {
+    Serial.printf("[ml] ERRO signal_from_buffer: %d\n", sigErr);
+    goIdle("Erro buffer ML");
+    return;
+  }
+
+  ei_impulse_result_t result = {0};
+  EI_IMPULSE_ERROR status = run_classifier(&signal, &result, false);
+  if (status != EI_IMPULSE_OK) {
+    Serial.printf("[ml] ERRO run_classifier: %d\n", (int)status);
+    goIdle("Erro classificador");
+    return;
+  }
+
+  // 4. MELHOR RESULTADO (sempre aceite — sem retry)
+  float bestScore = 0.0f;
+  int bestIdx = 0;
+  Serial.println("[ml] Resultados:");
+  for (int i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+    float s = result.classification[i].value;
+    const char* l = result.classification[i].label;
+    Serial.printf("     %-12s %.4f\n", l, s);
+    if (s > bestScore) { bestScore = s; bestIdx = i; }
+  }
+
+  const char* bestLabel = result.classification[bestIdx].label;
+  Serial.printf("[ml] Melhor: %s (%.0f%%)  peakAccel=%.2f\n", bestLabel, bestScore * 100.0f, peakAccel);
+
+  // 5. MAPEAR label minúscula do modelo → payload maiúscula para o servidor
+  GestureResult gesture = mapModelToGesture(bestLabel, bestScore);
+
+  // 6. Se for "parado" (payload vazio) → volta ao idle, não envia nada
+  if (strlen(gesture.payload) == 0) {
+    Serial.println("[ml] Nenhum gesto valido (parado). A voltar ao idle.");
+    drawMLResult(gesture, false, -1);
+    appState = STATE_RESULT;
+    returnToIdleAt = millis() + RESULT_RETURN_MS;
+    return;
+  }
+
+  // 7. Enviar para o servidor
+  int httpCode = -1;
+  bool sent = postMLGesture(gesture.payload, gesture.title, httpCode);
+  drawMLResult(gesture, sent, httpCode);
+
+  appState = STATE_RESULT;
+  returnToIdleAt = millis() + RESULT_RETURN_MS;
 }
 
 void recoverImuIfNeeded() {
@@ -912,7 +857,6 @@ void loop() {
   if (!readImu(reading)) { recoverImuIfNeeded(); delay(50); return; }
 
   float accelDelta = accelDeltaFromPrevious(reading);
-  float accelZDelta = accelZDeltaFromPrevious(reading);
   float gyroAbs = gyroMagnitudeDps(reading);
 
   printImuStatus(reading, accelDelta, gyroAbs);
@@ -946,7 +890,7 @@ void loop() {
       processContext();
       break;
     case STATE_GESTURE:
-      processGesture(reading, accelDelta, accelZDelta);
+      processGesture(reading, accelDelta, 0); // accelZDelta unused
       break;
     case STATE_RESULT:
     default:
