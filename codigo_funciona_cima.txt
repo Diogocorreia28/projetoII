@@ -1,0 +1,145 @@
+#include <M5Unified.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <math.h>
+#include "BMI088.h"
+
+const char* WIFI_SSID = "Vodafone-46F617 _EXT_2.4G";
+const char* WIFI_PASS = "portugalia1";
+const char* SERVER_URL = "http://192.168.1.233:5000/api/trigger";
+
+const int SDA_PIN = 32;
+const int SCL_PIN = 33;
+
+Bmi088Accel accel(Wire, 0x19);
+Bmi088Gyro gyro(Wire, 0x69);
+
+float ax0 = 0, ay0 = 0, az0 = 0;
+bool calibrated = false;
+
+unsigned long lastSend = 0;
+const unsigned long cooldownMs = 1500;
+
+bool postGesture(const char* gesture) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  HTTPClient http;
+  http.begin(SERVER_URL);
+  http.addHeader("Content-Type", "application/json");
+
+  String payload = String("{\"gesto\":\"") + gesture + "\"}";
+  int code = http.POST(payload);
+
+  Serial.print("Payload enviado: ");
+  Serial.println(payload);
+  Serial.print("HTTP code: ");
+  Serial.println(code);
+
+  http.end();
+
+  return code > 0 && code < 400;
+}
+
+void calibrateZero() {
+  const int n = 50;
+  float sx = 0, sy = 0, sz = 0;
+
+  for (int i = 0; i < n; i++) {
+    accel.readSensor();
+    sx += accel.getAccelX_mss();
+    sy += accel.getAccelY_mss();
+    sz += accel.getAccelZ_mss();
+    delay(20);
+  }
+
+  ax0 = sx / n;
+  ay0 = sy / n;
+  az0 = sz / n;
+  calibrated = true;
+}
+
+void setup() {
+  auto cfg = M5.config();
+  cfg.clear_display = true;
+  M5.begin(cfg);
+
+  Serial.begin(115200);
+  delay(1000);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("A ligar ao WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+  Serial.print("WiFi ligado. IP: ");
+  Serial.println(WiFi.localIP());
+
+  Serial.println("A iniciar BMI088...");
+  if (accel.begin() < 0) {
+    Serial.println("Erro a iniciar acelerometro");
+    while (1) delay(1000);
+  }
+
+  if (gyro.begin() < 0) {
+    Serial.println("Erro a iniciar giroscopio");
+    while (1) delay(1000);
+  }
+
+  Serial.println("Calibrando...");
+  calibrateZero();
+  Serial.println("Calibrado");
+}
+
+void loop() {
+  accel.readSensor();
+  gyro.readSensor();
+
+  float ax = accel.getAccelX_mss() - ax0;
+  float ay = accel.getAccelY_mss() - ay0;
+  float az = accel.getAccelZ_mss() - az0;
+
+  Serial.print("AX: "); Serial.print(ax, 3);
+  Serial.print(" AY: "); Serial.print(ay, 3);
+  Serial.print(" AZ: "); Serial.println(az, 3);
+
+  float mag = sqrt(ax * ax + ay * ay + az * az);
+
+  bool gestoCima = false;
+  bool gestoBaixo = false;
+
+  if (millis() - lastSend > cooldownMs) {
+    if (az > 6.0 && mag > 7.0) {
+      gestoCima = true;
+    }
+    else if (az < -6.0 && mag > 7.0) {
+      gestoBaixo = true;
+    }
+  }
+
+  if (gestoCima) {
+    Serial.println("Gesto Cima detetado");
+    if (postGesture("Cima")) {
+      Serial.println("Enviado ao servidor");
+      lastSend = millis();
+    } else {
+      Serial.println("Falha ao enviar");
+    }
+  }
+
+  if (gestoBaixo) {
+    Serial.println("Gesto Baixo detetado");
+    if (postGesture("Baixo")) {
+      Serial.println("Enviado ao servidor");
+      lastSend = millis();
+    } else {
+      Serial.println("Falha ao enviar");
+    }
+  }
+
+  delay(50);
+}
