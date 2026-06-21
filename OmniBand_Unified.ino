@@ -695,102 +695,105 @@ void processContext() {
 
 // =====================================================================
 // ML-powered processGesture()
-// Flow: PREPARA (1s) → JA! → capture 1s → infer → classify → send
-// No retry loop — accepts best result and moves on
+// Flow: PREPARA (1s) → JA! → capture 1s → infer → classify
+// If "parado": loops back to PREPARA/JA! until a valid gesture is detected
+// If "cima"/"baixo": sends to server → shows result → returns to idle
 // =====================================================================
 void processGesture(const ImuReading& reading, float accelDelta, float accelZDelta) {
-  // 1. SINCRONIZAÇÃO: ecrã dita o momento
-  drawBoot("PREPARA...", "Nao te mexas.", "Gesto no proximo ecra!");
-  delay(1000);
+  while (true) {
+    // 1. SINCRONIZAÇÃO: ecrã dita o momento
+    drawBoot("PREPARA...", "Nao te mexas.", "Gesto no proximo ecra!");
+    delay(1000);
 
-  // 2. SINAL DE ARRANQUE E RECOLHA (1s a 100Hz)
-  drawBoot("JA!", "FAZ O GESTO AGORA", "A gravar 1 segundo...");
-  Serial.println("[ml] JA! A recolher 1s...");
+    // 2. SINAL DE ARRANQUE E RECOLHA (1s a 100Hz)
+    drawBoot("JA!", "FAZ O GESTO AGORA", "A gravar 1 segundo...");
+    Serial.println("[ml] JA! A recolher 1s...");
 
-  const int numSamples = EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE / 6;
-  static float buffer[EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE];
-  float peakAccel = 0.0f;
+    const int numSamples = EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE / 6;
+    static float buffer[EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE];
+    float peakAccel = 0.0f;
 
-  for (int i = 0; i < numSamples; i++) {
-    unsigned long t0 = millis();
+    for (int i = 0; i < numSamples; i++) {
+      unsigned long t0 = millis();
 
-    accel->readSensor();
-    gyro->readSensor();
+      accel->readSensor();
+      gyro->readSensor();
 
-    int base = i * 6;
-    float ax = accel->getAccelX_mss();
-    float ay = accel->getAccelY_mss();
-    float az = accel->getAccelZ_mss();
-    float gx = gyro->getGyroX_rads() * RAD_TO_DEG_PER_SEC;
-    float gy = gyro->getGyroY_rads() * RAD_TO_DEG_PER_SEC;
-    float gz = gyro->getGyroZ_rads() * RAD_TO_DEG_PER_SEC;
+      int base = i * 6;
+      float ax = accel->getAccelX_mss();
+      float ay = accel->getAccelY_mss();
+      float az = accel->getAccelZ_mss();
+      float gx = gyro->getGyroX_rads() * RAD_TO_DEG_PER_SEC;
+      float gy = gyro->getGyroY_rads() * RAD_TO_DEG_PER_SEC;
+      float gz = gyro->getGyroZ_rads() * RAD_TO_DEG_PER_SEC;
 
-    buffer[base + 0] = ax;
-    buffer[base + 1] = ay;
-    buffer[base + 2] = az;
-    buffer[base + 3] = gx;
-    buffer[base + 4] = gy;
-    buffer[base + 5] = gz;
+      buffer[base + 0] = ax;
+      buffer[base + 1] = ay;
+      buffer[base + 2] = az;
+      buffer[base + 3] = gx;
+      buffer[base + 4] = gy;
+      buffer[base + 5] = gz;
 
-    float mag = sqrtf(ax*ax + ay*ay + az*az);
-    if (mag > peakAccel) peakAccel = mag;
+      float mag = sqrtf(ax*ax + ay*ay + az*az);
+      if (mag > peakAccel) peakAccel = mag;
 
-    long remaining = 10L - (long)(millis() - t0);
-    if (remaining > 0) delay(remaining);
-  }
+      long remaining = 10L - (long)(millis() - t0);
+      if (remaining > 0) delay(remaining);
+    }
 
-  drawBoot("A processar...", "A classificar com IA", "Aguarda...");
+    drawBoot("A processar...", "A classificar com IA", "Aguarda...");
 
-  // 3. INFERÊNCIA ML
-  signal_t signal;
-  int sigErr = numpy::signal_from_buffer(buffer, EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE, &signal);
-  if (sigErr != 0) {
-    Serial.printf("[ml] ERRO signal_from_buffer: %d\n", sigErr);
-    goIdle("Erro buffer ML");
-    return;
-  }
+    // 3. INFERÊNCIA ML
+    signal_t signal;
+    int sigErr = numpy::signal_from_buffer(buffer, EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE, &signal);
+    if (sigErr != 0) {
+      Serial.printf("[ml] ERRO signal_from_buffer: %d\n", sigErr);
+      goIdle("Erro buffer ML");
+      return;
+    }
 
-  ei_impulse_result_t result = {0};
-  EI_IMPULSE_ERROR status = run_classifier(&signal, &result, false);
-  if (status != EI_IMPULSE_OK) {
-    Serial.printf("[ml] ERRO run_classifier: %d\n", (int)status);
-    goIdle("Erro classificador");
-    return;
-  }
+    ei_impulse_result_t result = {0};
+    EI_IMPULSE_ERROR status = run_classifier(&signal, &result, false);
+    if (status != EI_IMPULSE_OK) {
+      Serial.printf("[ml] ERRO run_classifier: %d\n", (int)status);
+      goIdle("Erro classificador");
+      return;
+    }
 
-  // 4. MELHOR RESULTADO (sempre aceite — sem retry)
-  float bestScore = 0.0f;
-  int bestIdx = 0;
-  Serial.println("[ml] Resultados:");
-  for (int i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
-    float s = result.classification[i].value;
-    const char* l = result.classification[i].label;
-    Serial.printf("     %-12s %.4f\n", l, s);
-    if (s > bestScore) { bestScore = s; bestIdx = i; }
-  }
+    // 4. MELHOR RESULTADO
+    float bestScore = 0.0f;
+    int bestIdx = 0;
+    Serial.println("[ml] Resultados:");
+    for (int i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+      float s = result.classification[i].value;
+      const char* l = result.classification[i].label;
+      Serial.printf("     %-12s %.4f\n", l, s);
+      if (s > bestScore) { bestScore = s; bestIdx = i; }
+    }
 
-  const char* bestLabel = result.classification[bestIdx].label;
-  Serial.printf("[ml] Melhor: %s (%.0f%%)  peakAccel=%.2f\n", bestLabel, bestScore * 100.0f, peakAccel);
+    const char* bestLabel = result.classification[bestIdx].label;
+    Serial.printf("[ml] Melhor: %s (%.0f%%)  peakAccel=%.2f\n", bestLabel, bestScore * 100.0f, peakAccel);
 
-  // 5. MAPEAR label minúscula do modelo → payload maiúscula para o servidor
-  GestureResult gesture = mapModelToGesture(bestLabel, bestScore);
+    // 5. MAPEAR label minúscula do modelo → payload maiúscula para o servidor
+    GestureResult gesture = mapModelToGesture(bestLabel, bestScore);
 
-  // 6. Se for "parado" (payload vazio) → volta ao idle, não envia nada
-  if (strlen(gesture.payload) == 0) {
-    Serial.println("[ml] Nenhum gesto valido (parado). A voltar ao idle.");
-    drawMLResult(gesture, false, -1);
+    // 6. Se for "parado" (payload vazio) → repetir ciclo
+    if (strlen(gesture.payload) == 0) {
+      Serial.println("[ml] Parado. A repetir... Faz o gesto quando aparecer JA!");
+      drawBoot("Parado", "Vou repetir...", "Prepara o pulso!");
+      delay(2000);
+      continue;  // volta ao início do while → PREPARA → JA!
+    }
+
+    // 7. Gesto válido! Enviar para o servidor
+    int httpCode = -1;
+    bool sent = postMLGesture(gesture.payload, gesture.title, httpCode);
+    drawMLResult(gesture, sent, httpCode);
+
     appState = STATE_RESULT;
     returnToIdleAt = millis() + RESULT_RETURN_MS;
-    return;
+    return;  // sai da função, volta ao loop() normal
   }
-
-  // 7. Enviar para o servidor
-  int httpCode = -1;
-  bool sent = postMLGesture(gesture.payload, gesture.title, httpCode);
-  drawMLResult(gesture, sent, httpCode);
-
-  appState = STATE_RESULT;
-  returnToIdleAt = millis() + RESULT_RETURN_MS;
 }
 
 void recoverImuIfNeeded() {
